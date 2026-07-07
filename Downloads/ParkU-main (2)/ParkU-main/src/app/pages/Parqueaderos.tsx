@@ -36,6 +36,7 @@ import {
   FileText,
   Calendar,
   UserCircle2,
+  Image as ImageIcon,
 } from "lucide-react";
 import { createWorker } from "tesseract.js";
 import { toast } from "sonner";
@@ -92,6 +93,7 @@ export interface IncidenteForm {
   descripcion: string;
   asignadoA: string;
   notasResolucion: string;
+  evidencia: string; // base64 o URL de objeto
 }
 
 export interface CeldaPos extends Celda { x: number; y: number; }
@@ -1034,7 +1036,7 @@ export default function Parqueaderos() {
   const [pqForm, setPqForm]         = useState<FormParqueadero>({ nombre: "", bloque: "A", tipo: "general", direccion: "", horaInicio: "06:00", horaFin: "22:00", celdasCarros: 8, celdasMotos: 2, celdasMovilidadReducida: 1, descripcion: "" });
   const [formError, setFormError]   = useState<string | null>(null);
   const [vehiculoForm, setVehiculoForm] = useState<VehiculoForm>({ placa: "", conductor: "", esOficial: false });
-  const [incidenteForm, setIncidenteForm] = useState<IncidenteForm>({ descripcion: "", asignadoA: "", notasResolucion: "" });
+  const [incidenteForm, setIncidenteForm] = useState<IncidenteForm>({ descripcion: "", asignadoA: "", notasResolucion: "", evidencia: "" });
   const [incidenteError, setIncidenteError] = useState<string | null>(null);
   const [placaError, setPlacaError] = useState<string | null>(null);
   const [ocrLoading, setOcrLoading] = useState(false);
@@ -1060,6 +1062,25 @@ export default function Parqueaderos() {
   const videoRef  = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const { reconocer, reconocerLicencia, liberarWorker } = useOcrPlaca();
+
+  // Manejador para subir evidencia en incidentes
+  const handleIncidenteFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      toast.error('El archivo debe ser una imagen');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      setIncidenteForm(prev => ({ ...prev, evidencia: ev.target?.result as string || '' }));
+    };
+    reader.readAsDataURL(file);
+  }, []);
+
+  const removeIncidenteEvidencia = useCallback(() => {
+    setIncidenteForm(prev => ({ ...prev, evidencia: '' }));
+  }, []);
 
   useEffect(() => { const i = setInterval(() => forceTick(t => t + 1), 30000); return () => clearInterval(i); }, []);
 
@@ -1173,6 +1194,8 @@ export default function Parqueaderos() {
     setCeldaSeleccionadaId(celda.id);
     setPlacaError(null);
     setIncidenteError(null);
+    // Resetear evidencia al abrir incidente
+    setIncidenteForm(prev => ({ ...prev, evidencia: '' }));
     if (celda.estado === "no_disponible") {
       const ocupante = getOcupante(celda.id);
       setVehiculoForm({ 
@@ -1486,10 +1509,10 @@ export default function Parqueaderos() {
     setScannedPlate(undefined);
   };
 
-  /* ── REGISTRAR INCIDENTE ── */
+  /* ── REGISTRAR INCIDENTE (con evidencia) ── */
   const registrarIncidente = useCallback(() => {
     if (!celdaActiva || !ocupanteActivo) return;
-    const { descripcion, asignadoA, notasResolucion } = incidenteForm;
+    const { descripcion, asignadoA, notasResolucion, evidencia } = incidenteForm;
     if (!descripcion.trim()) {
       setIncidenteError("La descripción del incidente es obligatoria.");
       return;
@@ -1504,12 +1527,13 @@ export default function Parqueaderos() {
       conductor: ocupanteActivo.conductor?.nombre || "",
       asignadoA: asignadoA.trim() || undefined,
       notasResolucion: notasResolucion.trim() || undefined,
+      evidencia: evidencia || undefined,
       fecha: new Date().toISOString(),
       estado: "pendiente" as const,
     };
 
     addIncidente(incidenteData);
-    setIncidenteForm({ descripcion: "", asignadoA: "", notasResolucion: "" });
+    setIncidenteForm({ descripcion: "", asignadoA: "", notasResolucion: "", evidencia: "" });
     setIncidenteError(null);
     setOpenModal(null);
     toast.success("Incidente registrado correctamente.");
@@ -2022,7 +2046,7 @@ export default function Parqueaderos() {
         </div>
       </Modal>
 
-      {/* ── MODAL INCIDENTE ── */}
+      {/* ── MODAL INCIDENTE (con evidencia) ── */}
       <Modal open={openModal === "incidente"} onClose={() => setOpenModal(null)} maxWidth={520}>
         <ModalHeader 
           eyebrow={`Celda ${celdaActiva?.numero ?? ""} · ${ocupanteActivo?.vehiculo.placa || ""}`} 
@@ -2095,6 +2119,57 @@ export default function Parqueaderos() {
               }}
             />
           </div>
+
+          {/* Evidencia fotográfica */}
+          <div>
+            <label style={{ display: "block", fontSize: 12, fontWeight: 700, color: C.text, marginBottom: 6 }}>
+              Evidencia fotográfica (opcional)
+            </label>
+            <div style={{
+              borderRadius: 11, border: `2px dashed ${C.border}`,
+              background: "#F8FAFC", overflow: "hidden",
+              transition: "border-color .2s",
+            }}>
+              <input
+                type="file"
+                id="evidenciaIncidente"
+                accept="image/*"
+                onChange={handleIncidenteFileChange}
+                style={{ display: "none" }}
+              />
+              {incidenteForm.evidencia ? (
+                <div style={{ padding: "12px", textAlign: "center", position: "relative" }}>
+                  <button
+                    onClick={removeIncidenteEvidencia}
+                    aria-label="Quitar evidencia"
+                    style={{
+                      position: "absolute", top: 8, right: 8,
+                      width: 24, height: 24, borderRadius: 7,
+                      border: "none", background: "rgba(15,23,42,.55)",
+                      color: "#fff", cursor: "pointer",
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                    }}
+                  >
+                    <X size={13} />
+                  </button>
+                  <img
+                    src={incidenteForm.evidencia}
+                    alt="Evidencia del incidente"
+                    style={{ maxHeight: 120, margin: "0 auto", borderRadius: 8 }}
+                  />
+                  <p style={{ fontSize: 11, color: C.primary, marginTop: 8 }}>Evidencia cargada ✓</p>
+                </div>
+              ) : (
+                <label htmlFor="evidenciaIncidente" style={{ cursor: "pointer", display: "block" }}>
+                  <div style={{ padding: "16px", textAlign: "center" }}>
+                    <Upload size={32} color={C.textLight} style={{ margin: "0 auto 8px" }} />
+                    <p style={{ fontSize: 12, color: C.textLight }}>Toca para cargar imagen de evidencia</p>
+                    <p style={{ fontSize: 10, color: C.textLight, marginTop: 4 }}>Formatos: JPG, PNG, GIF</p>
+                  </div>
+                </label>
+              )}
+            </div>
+          </div>
           
           <div style={{ fontSize: 12, color: C.textLight, background: C.bg, padding: "12px 14px", borderRadius: 10, border: `1px solid ${C.border}` }}>
             <div style={{ fontWeight: 600, marginBottom: 4, color: C.text }}>Información automática:</div>
@@ -2105,7 +2180,7 @@ export default function Parqueaderos() {
           </div>
         </div>
         <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", padding: "1rem 1.8rem", borderTop: `1px solid ${C.border}` }}>
-          <button onClick={() => { setOpenModal(null); setIncidenteError(null); }} style={{ padding: "10px 20px", borderRadius: 12, border: `1px solid ${C.border}`, background: "#fff", color: C.text, fontSize: 13, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>Cancelar</button>
+          <button onClick={() => { setOpenModal(null); setIncidenteError(null); setIncidenteForm(prev => ({ ...prev, evidencia: '' })); }} style={{ padding: "10px 20px", borderRadius: 12, border: `1px solid ${C.border}`, background: "#fff", color: C.text, fontSize: 13, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>Cancelar</button>
           <button
             onClick={registrarIncidente}
             style={{
