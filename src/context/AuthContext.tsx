@@ -1,0 +1,340 @@
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useState
+} from 'react';
+import { useQueryClient } from '@tanstack/react-query';
+import * as authService from '../services/api/auth';
+import { getToken, clearTokens } from '../services/core/tokenStorage';
+import { leerFoto, guardarFoto } from '../services/core/fotosPerfil';
+import { AUTH_EXPIRED_EVENT } from '../services/core/http';
+import { limpiarCacheDeQueries } from '../services/core/cacheQueries';
+import { ROLES, permisosDeVistas, type PermisosRol } from '../services/core/roles';
+
+interface User {
+  id: string;
+  correo: string;
+  nombre: string;
+  numero: string;
+  /** Id real del rol: uno de los tres del sistema o uno creado a medida (ver AuthUser). */
+  rol: number;
+  foto?: string;
+  /** Permisos del rol tal como los nombra la API ("reservas.gestionar"…). De ellos salen
+   *  las pantallas visibles -- ver permisosDeVistas en services/core/roles.ts. */
+  permisos?: string[];
+  /** Nombre real del rol (tabla `rol` del backend), para no depender de la tabla fija de
+   *  tres que hay en el frontend. */
+  rolNombre?: string;
+  /** Documento de la cuenta: es lo que identifica a la persona en su Perfil. */
+  tipoDocumento?: string;
+  numeroDocumento?: string;
+}
+
+interface AuthContextType {
+  user: User | null;
+
+  login: (
+    correo: string,
+    password: string
+  ) => Promise<boolean>;
+
+  register: (data: authService.RegisterInput) => Promise<boolean>;
+
+  googleLogin: (userData: any) => void;
+
+  logout: () => void;
+
+  // Refleja en la sesión (estado + localStorage) lo que ya se guardó en la API. La pantalla
+  // de Perfil llama primero a PUT /usuarios/perfil y luego a esto con la respuesta, para que
+  // la cabecera y la barra lateral no sigan mostrando los datos viejos hasta recargar.
+  // `foto` es la excepción: no es columna de `usuario`, vive solo en este navegador.
+  updateUser: (data: Partial<Pick<User, 'nombre' | 'numero' | 'correo' | 'foto' | 'tipoDocumento' | 'numeroDocumento'>>) => void;
+
+  changePassword: (currentPassword: string, newPassword: string) => Promise<boolean>;
+
+  // Verifica correo + documento + nombre contra una cuenta existente y, si coinciden,
+  // devuelve el token de recuperación (de un solo uso) para usar con resetPasswordWithToken.
+  // Lanza si los datos no coinciden con ninguna cuenta.
+  verificarIdentidad: (data: authService.VerificarIdentidadInput) => Promise<string>;
+
+  // Valida el token de un enlace de recuperación y, si es válido, actualiza
+  // la contraseña del usuario asociado. El token es de un solo uso.
+  resetPasswordWithToken: (
+    token: string,
+    newPassword: string
+  ) => Promise<{ ok: boolean; message?: string }>;
+
+  isAuthenticated: boolean;
+
+  // Pantallas que puede abrir el usuario autenticado: su rol más los permisos que la API
+  // le devuelve (ver permisosDeVistas en services/core/roles.ts).
+  permisos: PermisosRol | null;
+
+  hasPermission: (key: keyof PermisosRol) => boolean;
+
+  /** Vuelve a preguntar a la API por el rol y los permisos de esta sesión. La pantalla de
+   *  Roles la llama tras guardar, para que un permiso recién concedido se vea sin tener
+   *  que cerrar sesión. */
+  refrescarPermisos: () => Promise<void>;
+}
+
+const AuthContext =
+  createContext<AuthContextType | undefined>(
+    undefined
+  );
+
+const USER_STORAGE_KEY = 'parkUUser';
+
+/** La foto de perfil vive en una llave APARTE de `parkUUser`, indexada por id de usuario —
+ *  el modelo real de Usuario no tiene columna `foto` (ver el comentario de `updateUser` más
+ *  abajo), así que `logout()` no puede "guardarla en el backend" antes de borrar la sesión.
+ *  Guardándola por separado, sobrevive a `persistUser(null)` (logout) y se puede volver a
+ *  fusionar en el próximo login de la MISMA cuenta en este mismo navegador — antes vivía solo
+ *  dentro de `parkUUser`, así que cada logout la borraba sin remedio. El almacén concreto vive
+ *  en services/core/fotosPerfil.ts, compartido con los listados de Usuarios y Conductores:
+ *  la foto que alguien se pone acá es la que esas pantallas muestran para su cuenta. */
+
+/** Completa `foto` desde el almacenamiento propio si el usuario recién resuelto (login/registro/
+ *  hidratación inicial) no trae una — pasa exactamente igual si ya la tenía. */
+function conFotoGuardada(u: User): User {
+  if (u.foto) return u;
+  const foto = leerFoto('usuario', u.id);
+  return foto ? { ...u, foto } : u;
+}
+
+export function AuthProvider({
+  children
+}: {
+  children: React.ReactNode;
+}) {
+  // Inicializador perezoso: lee localStorage de forma síncrona en el primer
+  // render, para que isAuthenticated ya sea correcto antes de que
+  // ProtectedRoute decida si redirige a /login (evita el "flash" a login
+  // en cada recarga de página con una sesión válida). Se valida contra el
+  // backend por separado (ver useEffect abajo) — leer localStorage aquí solo
+  // evita el parpadeo, no reemplaza esa validación.
+  const [user, setUser] = useState<User | null>(() => {
+    try {
+      if (!getToken()) return null;
+      const savedUser = localStorage.getItem(USER_STORAGE_KEY);
+      return savedUser ? conFotoGuardada(JSON.parse(savedUser)) : null;
+    } catch {
+      return null;
+    }
+  });
+
+  const queryClient = useQueryClient();
+
+  // useCallback (con el cliente de queries, que es estable) para que los efectos de abajo
+  // puedan declararla como dependencia sin volver a ejecutarse en cada render.
+  const persistUser = useCallback((next: User | null) => {
+    setUser(next);
+    try {
+      if (next) localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(next));
+      else localStorage.removeItem(USER_STORAGE_KEY);
+    } catch {
+      // localStorage no disponible — la sesión sigue funcionando en memoria para esta pestaña.
+    }
+    // Al terminar la sesión se vacían las listas descargadas, en memoria y en la copia
+    // persistida (ver services/core/cacheQueries.ts): en un equipo compartido, quien entre
+    // después no debe ver ni por un instante los datos de quien salió, y una cuenta con
+    // otro rol no debe arrancar con listas que la suya no puede leer.
+    if (!next) {
+      queryClient.clear();
+      limpiarCacheDeQueries();
+    }
+  }, [queryClient]);
+
+  // Confirma contra la API que el token guardado sigue siendo válido. Si
+  // expiró (o el usuario fue desactivado) desde la última visita, cierra la
+  // sesión local en vez de dejar una sesión "fantasma".
+  useEffect(() => {
+    if (!getToken()) return;
+    let cancelado = false;
+    authService.verificarToken().then((usuarioReal) => {
+      if (cancelado) return;
+      if (!usuarioReal) {
+        clearTokens();
+        persistUser(null);
+        return;
+      }
+      // Resincroniza contra la respuesta autoritativa del backend — antes se descartaba
+      // del todo, así que si el rol de alguien cambiaba en el servidor (o alguien editaba
+      // `parkUUser.rol` a mano desde DevTools), ni `hasPermission()` ni los guards de ruta
+      // se enteraban hasta un nuevo login. Nombre, correo, teléfono y documento también:
+      // desde que el perfil se guarda en la API (PUT /usuarios/perfil), la base manda sobre
+      // la copia local, y así una edición hecha en otro dispositivo -- o hecha por un
+      // administrador desde el módulo de Usuarios -- se ve al recargar. `foto` sigue siendo
+      // local: no es columna de `usuario`.
+      setUser((actual) => {
+        if (!actual) return actual;
+        // Los permisos y el nombre del rol también se resincronizan: si a este rol le
+        // concedieron (o quitaron) un permiso, o lo renombraron, mientras la sesión estaba
+        // abierta, la siguiente carga de la página ya lo refleja.
+        const next = {
+          ...actual,
+          rol: usuarioReal.rol,
+          permisos: usuarioReal.permisos ?? [],
+          rolNombre: usuarioReal.rolNombre ?? actual.rolNombre,
+          nombre: usuarioReal.nombre || actual.nombre,
+          correo: usuarioReal.correo || actual.correo,
+          // El teléfono y el documento SÍ pueden quedar vacíos a propósito (son opcionales),
+          // así que aquí se copia lo que diga el backend, incluido el vacío.
+          numero: usuarioReal.numero ?? actual.numero,
+          tipoDocumento: usuarioReal.tipoDocumento,
+          numeroDocumento: usuarioReal.numeroDocumento,
+        };
+        try {
+          localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(next));
+        } catch {
+          // localStorage no disponible — la sesión sigue funcionando en memoria para esta pestaña.
+        }
+        return next;
+      });
+    });
+    return () => {
+      cancelado = true;
+    };
+  }, [persistUser]);
+
+  // Si `http.ts` no logró renovar el token en un 401, cierra la sesión local.
+  useEffect(() => {
+    const onAuthExpired = () => persistUser(null);
+    window.addEventListener(AUTH_EXPIRED_EVENT, onAuthExpired);
+    return () => window.removeEventListener(AUTH_EXPIRED_EVENT, onAuthExpired);
+  }, [persistUser]);
+
+  // LOGIN NORMAL — valida contra la API real (correo/contraseña/estado) vía services/api/auth.ts.
+  const login = async (
+    correo: string,
+    password: string
+  ): Promise<boolean> => {
+    const loggedUser = await authService.login(correo, password);
+    persistUser(conFotoGuardada(loggedUser));
+    return true;
+  };
+
+  // REGISTRO — la API pública siempre crea rol Conductor y deja al usuario logueado.
+  const register = async (data: authService.RegisterInput): Promise<boolean> => {
+    const loggedUser = await authService.register(data);
+    persistUser(loggedUser);
+    return true;
+  };
+
+  // LOGIN GOOGLE — sin flujo de Firebase Auth conectado; se deja el estado
+  // local por compatibilidad, pero no llama a la API.
+  const googleLogin = (userData: any) => {
+    const googleUser: User = {
+      id: userData.uid,
+      correo: userData.email,
+      nombre: userData.displayName || 'Usuario',
+      numero: userData.phoneNumber || '',
+      rol: ROLES.CONDUCTOR,
+    };
+    persistUser(googleUser);
+  };
+
+  // LOGOUT
+  const logout = () => {
+    persistUser(null);
+    void authService.logout();
+  };
+
+  // ACTUALIZAR PERFIL (usado por la página Perfil, incl. la foto) — solo local, ver nota en el tipo.
+  const updateUser = (data: Partial<Pick<User, 'nombre' | 'numero' | 'correo' | 'foto' | 'tipoDocumento' | 'numeroDocumento'>>) => {
+    if (!user) return;
+    // La foto, además de vivir en `parkUUser`, se guarda en el almacén compartido para
+    // sobrevivir a un logout (ver la nota de arriba) y para que los listados de Usuarios y
+    // Conductores la vean — con `foto: ''` (quitar foto) se borra de ambos lados.
+    if (data.foto !== undefined) guardarFoto('usuario', user.id, data.foto);
+    persistUser({ ...user, ...data });
+  };
+
+  // CAMBIAR CONTRASEÑA (usado por la página Perfil)
+  const changePassword = async (currentPassword: string, newPassword: string): Promise<boolean> => {
+    if (!user) return false;
+    return authService.changePassword(user.id, currentPassword, newPassword);
+  };
+
+  // RECUPERAR CONTRASEÑA (usado por ForgotPassword / ResetPassword)
+  const verificarIdentidad = (data: authService.VerificarIdentidadInput): Promise<string> => {
+    return authService.verificarIdentidad(data);
+  };
+
+  const resetPasswordWithToken = (token: string, newPassword: string): Promise<{ ok: boolean; message?: string }> => {
+    return authService.resetPasswordWithToken(token, newPassword);
+  };
+
+  // PERMISOS — rol + permisos reales de la API (ver permisosDeVistas). Memorizados: el layout
+  // deriva de `hasPermission` el menú visible y la precarga de sus chunks, y solo debe
+  // rehacerlos cuando cambie de verdad el rol o sus permisos.
+  const permisos = useMemo(() => (user ? permisosDeVistas(user.rol, user.permisos ?? []) : null), [user]);
+
+  const hasPermission = useCallback((key: keyof PermisosRol): boolean => !!permisos?.[key], [permisos]);
+
+  /**
+   * Relee rol y permisos de la sesión desde la API. Se usa justo después de guardar los
+   * permisos de un rol: si es el rol de quien está usando la aplicación (o el suyo propio),
+   * el menú y los guardas de ruta se actualizan al momento, sin cerrar sesión.
+   */
+  const refrescarPermisos = async (): Promise<void> => {
+    if (!getToken()) return;
+    const usuarioReal = await authService.verificarToken();
+    if (!usuarioReal) return;
+    setUser((actual) => {
+      if (!actual) return actual;
+      const next = {
+        ...actual,
+        rol: usuarioReal.rol,
+        permisos: usuarioReal.permisos ?? [],
+        rolNombre: usuarioReal.rolNombre ?? actual.rolNombre,
+        tipoDocumento: usuarioReal.tipoDocumento ?? actual.tipoDocumento,
+        numeroDocumento: usuarioReal.numeroDocumento ?? actual.numeroDocumento,
+      };
+      try {
+        localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(next));
+      } catch {
+        // localStorage no disponible — la sesión sigue funcionando en memoria.
+      }
+      return next;
+    });
+  };
+
+  return (
+    <AuthContext.Provider
+      value={{
+        user,
+        login,
+        register,
+        googleLogin,
+        logout,
+        updateUser,
+        changePassword,
+        verificarIdentidad,
+        resetPasswordWithToken,
+        isAuthenticated: !!user,
+        permisos,
+        hasPermission,
+        refrescarPermisos
+      }}
+    >
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+export function useAuth() {
+
+  const context = useContext(AuthContext);
+
+  if (!context) {
+    throw new Error(
+      'useAuth debe ser usado dentro de AuthProvider'
+    );
+  }
+
+  return context;
+}

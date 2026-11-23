@@ -1,0 +1,649 @@
+/**
+ * Backend falso "de toda la app", para los tests de página que antes corrían
+ * contra el store mock compartido (`services/core/db.ts`, ya eliminado).
+ * Junta un `createFakeRestBackend` (ver `fakeApi.ts`) por dominio y enruta
+ * `apiFetch` según el prefijo de la URL — así una página que combina varios
+ * hooks de dominio (p. ej. Parqueaderos: parqueaderos+celdas+vehiculos+
+ * conductores+controlSalida+reservas) solo necesita un mock.
+ *
+ * Los datos semilla replican, en la forma de la API real, los mismos
+ * nombres/valores que usaba `db.ts` para que las aserciones de los tests de
+ * página existentes seguir funcionando con el mínimo de cambios.
+ */
+import { vi } from 'vitest';
+import { createFakeRestBackend } from './fakeApi';
+import { ROLES } from '@/services/core/roles';
+
+export const rolesSeed = [
+  { id: 1, nombre: 'Administrador', descripcion: 'Acceso total al sistema', estado: true },
+  { id: 2, nombre: 'Vigilante', descripcion: 'Gestión de entradas y salidas', estado: true },
+  { id: 3, nombre: 'Conductor', descripcion: 'Acceso básico', estado: true },
+  { id: 5, nombre: 'Supervisor', descripcion: 'Rol creado desde la pantalla de Roles', estado: true },
+];
+
+// Catálogo real de permisos (`/api/permisos`) y su asignación por rol
+// (`/api/roles-permisos`): la UI los edita con POST (asignar) y DELETE (quitar),
+// ver guardarPermisosDeRol en services/api/roles.ts.
+export const permisosSeed = [
+  { id: 1, modulo_id: 1, nombre: 'configuracion.gestionar', descripcion: 'Gestionar roles y permisos', estado: true, modulo: { id: 1, nombre: 'Configuración' } },
+  { id: 4, modulo_id: 3, nombre: 'parqueaderos.consultar', descripcion: 'Consultar parqueaderos y celdas', estado: true, modulo: { id: 3, nombre: 'Parqueaderos' } },
+  { id: 5, modulo_id: 3, nombre: 'parqueaderos.gestionar', descripcion: 'Gestionar parqueaderos y celdas', estado: true, modulo: { id: 3, nombre: 'Parqueaderos' } },
+];
+export const rolesPermisosSeed = [
+  { id: 1, rol: 1, permiso: 1, rol_nombre: 'Administrador', permiso_nombre: 'configuracion.gestionar' },
+  { id: 2, rol: 1, permiso: 4, rol_nombre: 'Administrador', permiso_nombre: 'parqueaderos.consultar' },
+];
+
+// `rol_id`: nombre real de la columna en `/usuarios` (confirmado en vivo —
+// `toFrontend` de services/api/usuarios.ts la lee así). El endpoint de login
+// sí anida el rol como `rol` en su respuesta (confirmado en vivo también);
+// `createAuthBackend` traduce el nombre al construir esa respuesta.
+// `tipo_documento`/`numero_documento` son columnas de `usuario` en la API real (migración
+// 002): el documento es de la cuenta, no del conductor vinculado. Se dejan dos cuentas sin
+// él a propósito, para cubrir el "Sin documento registrado" del listado.
+export const usuariosSeed: Array<{
+  id: number; correo: string; contrasena: string; nombre: string;
+  numero_telefonico?: string | null; rol_id: number; estado: string; createdAt?: string;
+  tipo_documento?: string | null; numero_documento?: string | null;
+}> = [
+    { id: 1, correo: 'admin@sena.edu.co', contrasena: 'Pass1234', nombre: 'Administrador ParkU', numero_telefonico: '3101234567', rol_id: 1, estado: 'ACTIVO', createdAt: '2025-01-10T08:00:00.000Z' },
+    { id: 2, correo: 'ana.martinez@sena.edu.co', contrasena: 'Pass1234', nombre: 'Ana Martínez R.', rol_id: 2, estado: 'ACTIVO', createdAt: '2025-06-01T08:00:00.000Z', tipo_documento: 'CC', numero_documento: '2345678901' },
+    { id: 3, correo: 'pedro.ruiz@sena.edu.co', contrasena: 'Pass1234', nombre: 'Pedro Ruiz G.', rol_id: 2, estado: 'ACTIVO', createdAt: '2025-03-20T08:00:00.000Z', tipo_documento: 'CC', numero_documento: '3456789012' },
+    { id: 4, correo: 'maria.diaz@ext.com', contrasena: 'Pass1234', nombre: 'María Díaz P.', rol_id: 3, estado: 'ACTIVO', createdAt: '2026-02-14T08:00:00.000Z' },
+  ];
+
+export const conductoresSeed = [
+  {
+    id: 1, usuario_id: 2, tipo_documento: 'CC', numero_documento: '2345678901', nombre_apellidos: 'Carlos López M.',
+    correo: 'ana.martinez@sena.edu.co', direccion: null, numero_telefonico: '3102345678', tipo_usuario_id: 1,
+    tipo_usuario_nombre: 'Aprendiz', regional_formacion: null, centro_formacion: 'Administración',
+    programa_formacion: null, vigencia: null, movilidad_reducida: false, tipo_discapacidad: null, estado: true,
+  },
+  {
+    id: 2, usuario_id: 3, tipo_documento: 'CC', numero_documento: '3456789012', nombre_apellidos: 'Pedro Ruiz G.',
+    correo: 'pedro.ruiz@sena.edu.co', direccion: null, numero_telefonico: '3103456789', tipo_usuario_id: 2,
+    tipo_usuario_nombre: 'Instructor', regional_formacion: null, centro_formacion: 'Diseño',
+    programa_formacion: null, vigencia: null, movilidad_reducida: false, tipo_discapacidad: null, estado: true,
+  },
+];
+
+export const vehiculosSeed = [
+  {
+    id: 1, placa: 'ABC123', tipo: 'CARRO', marca: 'Toyota', linea: 'Corolla', modelo: 2020, color: 'Blanco',
+    observaciones: 'Sedán 4 puertas', estado: true,
+    conductores: [{ id: 1, nombre_apellidos: 'Carlos López M.', DetallePropiedad: { es_principal: true } }],
+    conductor_principal_id: 1, conductor_principal_nombre: 'Carlos López M.',
+  },
+  {
+    id: 2, placa: 'DEF456', tipo: 'CARRO', marca: 'Yamaha', linea: 'FZ 25', modelo: 2022, color: 'Negro',
+    observaciones: 'Moto deportiva', estado: true,
+    conductores: [{ id: 2, nombre_apellidos: 'Pedro Ruiz G.', DetallePropiedad: { es_principal: true } }],
+    conductor_principal_id: 2, conductor_principal_nombre: 'Pedro Ruiz G.',
+  },
+];
+
+export const parqueaderosSeed = Array.from({ length: 7 }, (_, i) => ({
+  id: i + 1,
+  nombre: `PQ-${i + 1} Torre ${String.fromCharCode(65 + i)}`,
+  ubicacion: `Acceso Torre ${String.fromCharCode(65 + i)}`,
+  acceso: 'REGIONAL',
+  capacidad_maxima: 20,
+  hora_apertura: '06:00:00',
+  hora_cierre: '22:00:00',
+  estado: true,
+  zona: `Torre ${String.fromCharCode(65 + i)}`,
+  piso: 'Nivel 1',
+  descripcion: '',
+  tipo: i === 0 ? 'DOCENTES' : 'GENERAL',
+}));
+
+export const celdasSeed = [
+  { id: 1, parqueadero: 1, numero: 'C-001', tipo: 'CARRO', usabilidad: 'GENERAL', estado: 'OCUPADA', observaciones: null },
+  { id: 2, parqueadero: 1, numero: 'C-002', tipo: 'CARRO', usabilidad: 'GENERAL', estado: 'DISPONIBLE', observaciones: null },
+  { id: 3, parqueadero: 1, numero: 'M-001', tipo: 'MOTO', usabilidad: 'GENERAL', estado: 'DISPONIBLE', observaciones: null },
+  // Parqueadero 2 es exclusivo de motos (sin celdas de carro), para poder
+  // probar el filtro "Motos" del Dashboard.
+  { id: 4, parqueadero: 2, numero: 'M-001', tipo: 'MOTO', usabilidad: 'GENERAL', estado: 'DISPONIBLE', observaciones: null },
+  { id: 5, parqueadero: 2, numero: 'M-002', tipo: 'MOTO', usabilidad: 'GENERAL', estado: 'DISPONIBLE', observaciones: null },
+];
+
+export const controlSalidaSeed = [
+  {
+    id: 1, vehiculo_id: 1, conductor_id: 1, parqueadero_id: 1, celda_id: 1,
+    fecha_hora_ingreso: '2025-06-20T07:15:00.000Z', fecha_hora_salida: null, estado: 'DENTRO' as const,
+  },
+];
+
+export const reservasSeed: any[] = [];
+
+export const incidentesSeed = [
+  {
+    id: 1, tipo_novedad: 'MAL_ESTACIONAMIENTO', prioridad: 'MEDIA', descripcion: 'Vehículo mal estacionado bloqueando entrada',
+    parqueadero_id: 1, celda_id: 1, vehiculo_id: 1, usuario_asignado_id: null, usuario_reporta_id: 2,
+    fecha_hora: '2025-06-18T07:15:00.000Z', estado: 'PENDIENTE', justificacion_cierre: null,
+  },
+  {
+    id: 2, tipo_novedad: 'DANIO', prioridad: 'ALTA', descripcion: 'Derrame de aceite con posible caída de vehículo',
+    parqueadero_id: 1, celda_id: 2, vehiculo_id: null, usuario_asignado_id: null, usuario_reporta_id: 1,
+    fecha_hora: '2025-06-16T07:15:00.000Z', estado: 'PENDIENTE', justificacion_cierre: null,
+  },
+  {
+    id: 3, tipo_novedad: 'QUEJA', prioridad: 'CRITICA', descripcion: 'Barrera dañada en el acceso norte',
+    parqueadero_id: 1, celda_id: null, vehiculo_id: null, usuario_asignado_id: null, usuario_reporta_id: 1,
+    fecha_hora: '2025-06-20T07:15:00.000Z', estado: 'CERRADA', justificacion_cierre: 'Reparada por mantenimiento',
+  },
+  /* Una NOVEDAD: observación de la operación, sin tipo ni prioridad ni celda. Está en la
+     semilla a propósito, para que las pruebas puedan distinguirla de una avería. */
+  {
+    id: 4, clase: 'NOVEDAD', tipo_novedad: null, prioridad: null, descripcion: 'El portón hace ruido al abrir',
+    parqueadero_id: 1, celda_id: null, vehiculo_id: null, usuario_asignado_id: null, usuario_reporta_id: 1,
+    fecha_hora: '2025-06-21T07:15:00.000Z', estado: 'PENDIENTE', justificacion_cierre: null,
+  },
+];
+
+export const catalogosSeed = [
+  { id: 1, nombre: 'Aprendiz', descripcion: '', estado: true },
+  { id: 2, nombre: 'Instructor', descripcion: '', estado: true },
+  { id: 3, nombre: 'Administrativo', descripcion: '', estado: true },
+  { id: 4, nombre: 'Contratista', descripcion: '', estado: true },
+  { id: 5, nombre: 'Visitante', descripcion: '', estado: true },
+  { id: 6, nombre: 'Otro', descripcion: '', estado: true },
+];
+
+/**
+ * Backend falso de `/auth/*`: no es un recurso CRUD estándar (son rutas de
+ * acción — login/registro/verificar/recuperar/restablecer), así que no usa
+ * `createFakeRestBackend`. Opera directamente sobre `usuariosSeed` (incluida
+ * la `contrasena`, que el backend `/usuarios` no expone) para que un usuario
+ * registrado en un test pueda loguearse después con las mismas credenciales.
+ *
+ * `/auth/verificar` no recibe el header `Authorization` real (el mock
+ * reemplaza `apiFetch` completo, antes de que `http.ts` lo agregue), así que
+ * en su lugar confía en `parkUUser` de localStorage — igual de válido para
+ * el propósito del bootstrap de sesión en estos tests.
+ */
+function createAuthBackend() {
+  const resetTokens = new Map<string, string>();
+
+  function findAccount(correo: string) {
+    const c = (correo ?? '').trim().toLowerCase();
+    return usuariosSeed.find((u) => u.correo.trim().toLowerCase() === c);
+  }
+
+  async function apiFetch<R>(path: string, options: { method?: string; body?: unknown } = {}): Promise<R> {
+    const method = (options.method ?? 'GET').toUpperCase();
+    const body = (options.body ?? {}) as Record<string, any>;
+
+    if (method === 'POST' && path === '/auth/login') {
+      const account = findAccount(body.correo);
+      if (!account || account.contrasena !== body.contrasena) {
+        throw new Error('Contraseña incorrecta. Verifica tus credenciales.');
+      }
+      return {
+        success: true,
+        message: 'Login exitoso',
+        data: {
+          user: {
+            id: account.id, correo: account.correo, nombre: account.nombre, rol: account.rol_id, estado: account.estado,
+            numero: account.numero_telefonico ?? null,
+            // Igual que la API real: el documento viene ya en el login.
+            tipo_documento: account.tipo_documento ?? null,
+            numero_documento: account.numero_documento ?? null,
+          },
+          token: `fake-token-${account.id}`,
+          refreshToken: `fake-refresh-${account.id}`,
+          expiresIn: '7d',
+        },
+      } as unknown as R;
+    }
+
+    if (method === 'POST' && path === '/auth/registro') {
+      // La API real exige repetir la contraseña (400 "Debes confirmar la contraseña").
+      if (!body.confirmar_contrasena || body.confirmar_contrasena !== body.contrasena) {
+        throw new Error('Debes confirmar la contraseña (envía confirmar_contrasena)');
+      }
+      if (findAccount(body.correo)) {
+        throw new Error('Ya existe una cuenta registrada con este correo.');
+      }
+      const nextId = usuariosSeed.reduce((max, u) => Math.max(max, u.id), 0) + 1;
+      usuariosSeed.push({
+        id: nextId,
+        correo: body.correo,
+        contrasena: body.contrasena,
+        nombre: body.nombre,
+        numero_telefonico: body.numero ?? null,
+        rol_id: ROLES.CONDUCTOR,
+        estado: 'ACTIVO',
+        tipo_documento: body.tipo_documento ?? null,
+        numero_documento: body.numero_documento ?? null,
+      });
+      return { success: true, message: 'Registro exitoso', data: {} } as unknown as R;
+    }
+
+    if (method === 'POST' && path === '/auth/logout') {
+      return { success: true, message: 'Logout exitoso', data: {} } as unknown as R;
+    }
+
+    if (method === 'GET' && path === '/auth/verificar') {
+      const raw = (() => {
+        try { return localStorage.getItem('parkUUser'); } catch { return null; }
+      })();
+      if (!raw) throw new Error('No autenticado');
+      const u = JSON.parse(raw);
+      // La cuenta sembrada manda sobre lo que haya en localStorage: el backend real lee
+      // estos campos de la base en cada verificación, no del token.
+      const cuenta = findAccount(u.correo);
+      return {
+        success: true,
+        message: '',
+        data: {
+          usuario: {
+            id: Number(u.id), rol: Number(u.rol), estado: 'ACTIVO',
+            correo: cuenta?.correo ?? u.correo,
+            nombre: cuenta?.nombre ?? u.nombre,
+            numero: cuenta?.numero_telefonico ?? null,
+            tipo_documento: cuenta?.tipo_documento ?? null,
+            numero_documento: cuenta?.numero_documento ?? null,
+          },
+        },
+      } as unknown as R;
+    }
+
+    if (method === 'GET' && path.startsWith('/auth/existe-correo')) {
+      const correo = new URLSearchParams(path.split('?')[1] ?? '').get('correo') ?? '';
+      return { success: true, existe: !!findAccount(correo) } as unknown as R;
+    }
+
+    if (method === 'GET' && path.startsWith('/auth/existe-numero')) {
+      const numero = new URLSearchParams(path.split('?')[1] ?? '').get('numero') ?? '';
+      const existe = usuariosSeed.some((u) => (u as { numero_telefonico?: string }).numero_telefonico === numero);
+      return { success: true, existe } as unknown as R;
+    }
+
+    if (method === 'GET' && path.startsWith('/auth/existe-documento')) {
+      const qs = new URLSearchParams(path.split('?')[1] ?? '');
+      const tipoDocumento = qs.get('tipoDocumento') ?? '';
+      const numeroDocumento = qs.get('numeroDocumento') ?? '';
+      const existe = conductoresSeed.some((c) => c.tipo_documento === tipoDocumento && c.numero_documento === numeroDocumento);
+      return { success: true, existe } as unknown as R;
+    }
+
+    if (method === 'POST' && path === '/auth/verificar-identidad') {
+      const account = findAccount(body.correo);
+      const coincide = !!account
+        && account.tipo_documento && account.tipo_documento.toUpperCase() === (body.tipoDocumento ?? '').toString().trim().toUpperCase()
+        && account.numero_documento && account.numero_documento === (body.numeroDocumento ?? '').toString().trim()
+        && account.nombre.trim().toLowerCase() === (body.nombre ?? '').toString().trim().toLowerCase();
+      if (!coincide) {
+        throw new Error('Los datos no coinciden con ninguna cuenta registrada');
+      }
+      const token = `reset-${account!.id}-${Math.random().toString(36).slice(2)}`;
+      resetTokens.set(token, account!.correo.trim().toLowerCase());
+      return { success: true, message: 'Identidad verificada. Ya puedes definir tu nueva contraseña.', data: { token } } as unknown as R;
+    }
+
+    if (method === 'POST' && path === '/auth/restablecer-password') {
+      const correo = resetTokens.get(body.token);
+      if (!correo) throw new Error('El enlace de recuperación no es válido.');
+      const account = findAccount(correo);
+      if (account) account.contrasena = body.nuevaContrasena;
+      resetTokens.delete(body.token);
+      return { success: true, message: 'Contraseña actualizada correctamente' } as unknown as R;
+    }
+
+    throw new Error(`appFakeApi(auth): sin handler para ${method} ${path}`);
+  }
+
+  return { apiFetch: vi.fn(apiFetch) };
+}
+
+/**
+ * El rol Conductor ya puede consultar y reportar incidentes desde la vista del módulo.
+ * El mock mantiene el comportamiento permisivo para ese rol para que la UI y los tests
+ * reflejen la configuración real que se quiere en la aplicación.
+ */
+function createIncidentesBackend() {
+  // El rol Conductor ya tiene permisos de lectura y reporte sobre incidentes; no se impone
+  // ninguna restricción artificial aquí, independientemente del rol.
+  return createFakeRestBackend('/novedades', incidentesSeed);
+}
+
+/**
+ * Crea un set fresco de backends por dominio (uno por test, para no filtrar estado entre
+ * tests).
+ */
+export function createAppBackends() {
+  const rolesPermisos = createFakeRestBackend('/roles-permisos', rolesPermisosSeed, {
+    actions: [{
+      method: 'GET', pattern: /^\/rol\/(\d+)$/,
+      handle: (m, _body, items) => items.filter((i: any) => i.rol === Number(m[1])),
+    }],
+  });
+
+  /** Ids de permiso asignados a un rol, leídos del estado vivo de `rol_permiso`. */
+  const permisoIdsDeRol = (rolId: number) =>
+    (rolesPermisos.items as any[]).filter((rp) => rp.rol === rolId).map((rp) => rp.permiso);
+
+  const roles = createFakeRestBackend('/roles', rolesSeed, {
+    actions: [
+      {
+        // Reemplazo COMPLETO del conjunto de permisos del rol, igual que la API real: lo
+        // que no venga en `permisos` se retira (es la única forma de desmarcar una casilla).
+        method: 'PUT', pattern: /^\/(\d+)\/permisos$/,
+        handle: (m, body) => {
+          const rolId = Number(m[1]);
+          const deseados: number[] = ((body as any)?.permisos ?? []).map(Number);
+          const filas = rolesPermisos.items as any[];
+          for (let i = filas.length - 1; i >= 0; i--) {
+            if (filas[i].rol === rolId) filas.splice(i, 1);
+          }
+          let nextId = filas.reduce((max: number, f: any) => Math.max(max, f.id), 0);
+          for (const permiso of deseados) filas.push({ id: ++nextId, rol: rolId, permiso });
+          return { success: true, message: 'Permisos actualizados' };
+        },
+      },
+      {
+        // El rol trae sus `permiso_ids`: de ahí lee el front qué casillas marcar.
+        method: 'GET', pattern: /^\/(\d+)$/,
+        handle: (m, _body, items) => {
+          const rol = items.find((r: any) => r.id === Number(m[1]));
+          return rol ? { ...rol, permiso_ids: permisoIdsDeRol(rol.id) } : undefined;
+        },
+      },
+    ],
+  });
+  const usuarios = createFakeRestBackend('/usuarios', usuariosSeed.map(({ contrasena: _c, ...u }) => u), {
+    actions: [{
+      /**
+       * Comprobación "mientras se escribe" (GET /usuarios/disponibilidad). Los motivos son
+       * los genéricos: el backend real solo nombra al dueño del dato ocupado si quien
+       * pregunta ya puede consultar cuentas o conductores, y estas pantallas no asumen eso.
+       */
+      method: 'GET', pattern: /^\/disponibilidad(\?.*)?$/,
+      handle: (m, _body, items) => {
+        const qs = new URLSearchParams(String(m.input ?? '').split('?')[1] ?? '');
+        const excluir = Number(qs.get('excluir_usuario_id') ?? 0);
+        const cuentas = items as Array<Record<string, any>>;
+        const resultado: Record<string, any> = {};
+
+        const correo = qs.get('correo');
+        if (correo) {
+          const cuenta = cuentas.find((u) => String(u.correo).toLowerCase() === correo.toLowerCase());
+          const conductor = conductoresSeed.find((c) => (c as any).correo?.toLowerCase() === correo.toLowerCase());
+          resultado.correo = cuenta && cuenta.id !== excluir
+            ? { disponible: false, motivo: 'Ya existe una cuenta de acceso con ese correo' }
+            : conductor && conductor.usuario_id !== excluir
+              ? { disponible: false, motivo: 'Ese correo ya pertenece a otro conductor' }
+              : { disponible: true, motivo: null };
+        }
+
+        const telefono = qs.get('numero_telefonico');
+        if (telefono) {
+          const cuenta = cuentas.find((u) => u.numero_telefonico === telefono);
+          resultado.numero_telefonico = cuenta && cuenta.id !== excluir
+            ? { disponible: false, motivo: 'Ese número de teléfono ya está registrado en otra cuenta' }
+            : { disponible: true, motivo: null };
+        }
+
+        const numeroDocumento = qs.get('numero_documento');
+        const tipoDocumento = qs.get('tipo_documento');
+        if (numeroDocumento) {
+          const cuenta = cuentas.find((u) => u.tipo_documento === tipoDocumento && u.numero_documento === numeroDocumento);
+          const conductor = conductoresSeed.find((c) => c.tipo_documento === tipoDocumento && c.numero_documento === numeroDocumento);
+          resultado.documento = cuenta && cuenta.id !== excluir
+            ? { disponible: false, motivo: 'Ese documento ya está registrado en otra cuenta' }
+            : conductor && conductor.usuario_id !== excluir
+              ? { disponible: false, motivo: 'Ese documento ya pertenece a otro conductor' }
+              : { disponible: true, motivo: null };
+        }
+
+        resultado.disponible = Object.values(resultado).every((b: any) => b?.disponible !== false);
+        return resultado;
+      },
+    }, {
+      method: 'PATCH', pattern: /^\/(\d+)\/contrasena$/,
+      handle: (m, body, items) => {
+        const id = Number(m[1]);
+        const real = usuariosSeed.find((u) => u.id === id);
+        if (!real || real.contrasena !== (body as any).actual) throw new Error('Contraseña actual incorrecta');
+        real.contrasena = (body as any).nueva;
+        const idx = items.findIndex((i) => i.id === id);
+        return idx === -1 ? { message: 'Contraseña actualizada' } : items[idx];
+      },
+    }],
+  });
+  const conductores = createFakeRestBackend('/conductores', conductoresSeed);
+  const vehiculos = createFakeRestBackend('/vehiculos', vehiculosSeed, {
+    actions: [
+      {
+        method: 'POST', pattern: /^\/(\d+)\/conductores$/,
+        handle: (m, body, items) => {
+          const idx = items.findIndex((i: any) => i.id === Number(m[1]));
+          if (idx === -1) throw new Error('404');
+          const conductorId = (body as { conductor_id: number }).conductor_id;
+          const conductorReal = conductoresSeed.find((c) => c.id === conductorId);
+          const actuales = (items[idx] as any).conductores ?? [];
+          if (!actuales.some((c: any) => c.id === conductorId)) {
+            items[idx] = {
+              ...items[idx],
+              conductores: [...actuales, { id: conductorId, nombre_apellidos: conductorReal?.nombre_apellidos ?? '', DetallePropiedad: { es_principal: false } }],
+            };
+          }
+          return items[idx];
+        },
+      },
+      {
+        method: 'DELETE', pattern: /^\/(\d+)\/conductores\/(\d+)$/,
+        handle: (m, _body, items) => {
+          const idx = items.findIndex((i: any) => i.id === Number(m[1]));
+          if (idx === -1) throw new Error('404');
+          const conductorId = Number(m[2]);
+          items[idx] = {
+            ...items[idx],
+            conductores: ((items[idx] as any).conductores ?? []).filter((c: any) => c.id !== conductorId),
+          };
+          return items[idx];
+        },
+      },
+    ],
+  });
+  const parqueaderos = createFakeRestBackend('/parqueaderos', parqueaderosSeed, {
+    actions: [{
+      method: 'PATCH', pattern: /^\/(\d+)\/estado$/,
+      handle: (m, body, items) => {
+        const idx = items.findIndex((i) => i.id === Number(m[1]));
+        if (idx === -1) throw new Error('404');
+        items[idx] = { ...items[idx], estado: (body as any).estado };
+        return items[idx];
+      },
+    }],
+  });
+  const celdas = createFakeRestBackend('/celdas', celdasSeed, {
+    actions: [{
+      method: 'POST', pattern: /^\/parqueadero\/(\d+)\/generar-lote$/,
+      handle: (m, body, items) => {
+        const parqueaderoId = Number(m[1]);
+        const b = body as { cantidadCarro?: number; cantidadMoto?: number; cantidadMovilidadReducida?: number };
+        const config: [string, string, string, number][] = [
+          ['C-', 'CARRO', 'GENERAL', b.cantidadCarro ?? 0],
+          ['M-', 'MOTO', 'GENERAL', b.cantidadMoto ?? 0],
+          ['PMR-', 'CARRO', 'MOVILIDAD_REDUCIDA', b.cantidadMovilidadReducida ?? 0],
+        ];
+        const creadas: unknown[] = [];
+        for (const [prefijo, tipo, usabilidad, cantidad] of config) {
+          const usados = items
+            .filter((i: any) => i.parqueadero === parqueaderoId && String(i.numero).startsWith(prefijo))
+            .map((i: any) => parseInt(String(i.numero).slice(prefijo.length), 10))
+            .filter((n) => !Number.isNaN(n));
+          let siguiente = (usados.length ? Math.max(...usados) : 0) + 1;
+          for (let i = 0; i < cantidad; i++) {
+            const nextId = items.reduce((max, it) => Math.max(max, it.id), 0) + 1;
+            const nueva = {
+              id: nextId, parqueadero: parqueaderoId, numero: `${prefijo}${String(siguiente).padStart(3, '0')}`,
+              tipo, usabilidad, estado: 'DISPONIBLE', observaciones: null,
+            };
+            items.push(nueva);
+            creadas.push(nueva);
+            siguiente++;
+          }
+        }
+        return creadas;
+      },
+    }],
+  });
+  const controlSalida = createFakeRestBackend('/entradas-salidas', controlSalidaSeed, {
+    actions: [
+      {
+        method: 'POST', pattern: /^\/entrada$/,
+        handle: (_m, body, items) => {
+          const b = body as any;
+          const nextId = items.reduce((max, i) => Math.max(max, i.id), 0) + 1;
+          const created = {
+            id: nextId, vehiculo_id: b.vehiculo_id, conductor_id: b.conductor_id ?? null,
+            parqueadero_id: b.parqueadero_id, celda_id: b.celda_id ?? null,
+            fecha_hora_ingreso: b.fecha_hora_ingreso ?? new Date().toISOString(),
+            fecha_hora_salida: null, estado: 'DENTRO',
+          };
+          items.push(created);
+          return created;
+        },
+      },
+      {
+        method: 'POST', pattern: /^\/salida$/,
+        handle: (_m, body, items) => {
+          const b = body as any;
+          const idx = items.findIndex((i) => i.vehiculo_id === b.vehiculo_id && i.estado === 'DENTRO');
+          if (idx === -1) throw new Error('409');
+          items[idx] = { ...items[idx], fecha_hora_salida: b.fecha_hora_salida ?? new Date().toISOString(), estado: 'FINALIZADO' };
+          return items[idx];
+        },
+      },
+    ],
+  });
+  /**
+   * Reproduce lo que hace el backend real al cambiar el estado de una reserva: además de
+   * guardarlo, mueve la celda (trigger fn_reserva_bloquea_celda). Aceptar la retiene si
+   * estaba libre; cancelar, rechazar o terminar la suelta si era esta reserva quien la
+   * retenía. Las pantallas ya no tocan la celda por su cuenta, así que sin esto el fake
+   * dejaría la celda en un estado que la API real nunca deja.
+   */
+  const cambiarEstadoReserva = (idx: number, estado: string, items: any[], motivoRechazo?: string) => {
+    const anterior = items[idx].estado;
+    const TRANSICIONES: Record<string, string[]> = {
+      PENDIENTE: ['ACEPTADA', 'RECHAZADA', 'CANCELADA'],
+      ACEPTADA: ['TERMINADA', 'CANCELADA'],
+      RECHAZADA: [], TERMINADA: [], CANCELADA: [],
+    };
+    if (!(TRANSICIONES[anterior] ?? []).includes(estado)) {
+      throw new Error(`Una reserva ${String(anterior).toLowerCase()} no puede pasar a ${estado.toLowerCase()}`);
+    }
+
+    items[idx] = {
+      ...items[idx], estado,
+      ...(motivoRechazo !== undefined ? { motivo_rechazo: motivoRechazo } : {}),
+    };
+
+    const celdaIdx = (celdas.items as any[]).findIndex((c) => c.id === items[idx].celda_id);
+    if (celdaIdx !== -1) {
+      const celda = (celdas.items as any[])[celdaIdx];
+      if (estado === 'ACEPTADA' && celda.estado === 'DISPONIBLE') {
+        (celdas.items as any[])[celdaIdx] = { ...celda, estado: 'RESERVADA' };
+      }
+      if (anterior === 'ACEPTADA' && ['CANCELADA', 'RECHAZADA', 'TERMINADA'].includes(estado) && celda.estado === 'RESERVADA') {
+        (celdas.items as any[])[celdaIdx] = { ...celda, estado: 'DISPONIBLE' };
+      }
+    }
+
+    return items[idx];
+  };
+
+  const reservas = createFakeRestBackend('/reservas', reservasSeed, {
+    actions: [{
+      method: 'GET', pattern: /^\/vehiculo\/(\d+)$/,
+      handle: (m, _body, items) => items.filter((i: any) => i.vehiculo_id === Number(m[1])),
+    }, {
+      method: 'PATCH', pattern: /^\/(\d+)\/estado$/,
+      handle: (m, body, items) => {
+        const idx = items.findIndex((i) => i.id === Number(m[1]));
+        if (idx === -1) throw new Error('404');
+        const b = body as any;
+        // `motivo_rechazo` (snake_case) es el nombre del campo en el body. El backend real
+        // acepta también `motivoRechazo`, pero la aplicación manda este.
+        if (b.estado === 'RECHAZADA' && !b.motivo_rechazo?.trim()) {
+          throw new Error('motivo_rechazo es obligatorio al rechazar una reserva');
+        }
+        return cambiarEstadoReserva(idx, b.estado, items, b.motivo_rechazo);
+      },
+    }, {
+      // PATCH /reservas/:id/cancelar — la ruta de autoservicio: quien pidió la reserva puede
+      // echarse atrás sin permiso de gestión. Aquí no se comprueba de quién es (el fake no
+      // tiene sesión de verdad); lo que sí se reproduce es el efecto sobre la celda.
+      method: 'PATCH', pattern: /^\/(\d+)\/cancelar$/,
+      handle: (m, _body, items) => {
+        const idx = items.findIndex((i) => i.id === Number(m[1]));
+        if (idx === -1) throw new Error('404');
+        return cambiarEstadoReserva(idx, 'CANCELADA', items);
+      },
+    }],
+  });
+  const incidentes = createIncidentesBackend();
+  const catalogos = createFakeRestBackend('/catalogos/tipos-usuario', catalogosSeed);
+  const auth = createAuthBackend();
+
+  const backends: [string, ReturnType<typeof createFakeRestBackend>][] = [
+    ['/catalogos/tipos-usuario', catalogos],
+    ['/permisos', createFakeRestBackend('/permisos', permisosSeed)],
+    ['/roles-permisos', rolesPermisos],
+    ['/roles', roles],
+    ['/usuarios', usuarios],
+    ['/conductores', conductores],
+    ['/vehiculos', vehiculos],
+    ['/parqueaderos', parqueaderos],
+    ['/celdas', celdas],
+    ['/entradas-salidas', controlSalida],
+    ['/reservas', reservas],
+    ['/novedades', incidentes],
+  ];
+
+  /**
+   * PUT /usuarios/perfil — la cuenta de quien tiene la sesión abierta. Va aquí y no como
+   * acción del backend de `/usuarios` porque necesita a los dos: el backend real actualiza
+   * la cuenta y, en la misma transacción, la copia que guarda su conductor vinculado.
+   * Igual que el resto de este falso auth, la sesión se lee de `parkUUser`.
+   */
+  async function actualizarPerfil(body: Record<string, any>) {
+    const raw = (() => {
+      try { return localStorage.getItem('parkUUser'); } catch { return null; }
+    })();
+    if (!raw) throw new Error('No autenticado');
+    const id = Number(JSON.parse(raw).id);
+
+    const actualizada = await usuarios.apiFetch(`/usuarios/${id}`, { method: 'PUT', body });
+
+    const suConductor = (conductores.items as any[]).find((c) => c.usuario_id === id);
+    if (suConductor) {
+      const copia: Record<string, unknown> = {};
+      if (body.nombre !== undefined) copia.nombre_apellidos = body.nombre;
+      if (body.correo !== undefined) copia.correo = body.correo;
+      if (body.numero_telefonico !== undefined) copia.numero_telefonico = body.numero_telefonico;
+      if (body.tipo_documento !== undefined) copia.tipo_documento = body.tipo_documento;
+      if (body.numero_documento !== undefined) copia.numero_documento = body.numero_documento;
+      await conductores.apiFetch(`/conductores/${suConductor.id}`, { method: 'PUT', body: copia });
+    }
+
+    return actualizada;
+  }
+
+  const apiFetch = vi.fn(async (path: string, opts?: object) => {
+    // `/auth` no es un recurso CRUD del router genérico (ver createAuthBackend).
+    if (path.startsWith('/auth')) return auth.apiFetch(path, opts as any);
+    if (path === '/usuarios/perfil') {
+      return actualizarPerfil(((opts as { body?: Record<string, any> })?.body) ?? {});
+    }
+    const match = backends.find(([prefix]) => path.startsWith(prefix));
+    if (!match) throw new Error(`appFakeApi: sin router para ${path}`);
+    return match[1].apiFetch(path, opts as any);
+  });
+
+  return { apiFetch, roles, usuarios, conductores, vehiculos, parqueaderos, celdas, controlSalida, reservas, incidentes, catalogos, auth };
+}

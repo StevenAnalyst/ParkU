@@ -1,0 +1,93 @@
+import type { ReactNode } from "react";
+import {
+  IconAlertTriangle as AlertTriangle,
+  IconClock as Clock,
+  IconCircleCheck as CheckCircle,
+  IconArchive as Archive,
+  IconCircleX as XCircle,
+} from "@tabler/icons-react";
+import type { Celda } from "@/services/api/celdas";
+import type { Vehiculo } from "@/services/api/vehiculos";
+import type { OpcionBuscable } from "@/components/shared";
+import type { EstadoNovedad, TipoNovedad, PrioridadNovedad } from "@/services/api/incidentes";
+
+/** Config visual del estado de celda (mismo modelo que el módulo de Parqueaderos/Celdas). */
+export const CELDA_ESTADO_CONFIG: Record<Celda["estado"], { bg: string; text: string; border: string; label: string }> = {
+  disponible: { bg: "#F0FBE8", text: "#2F6B00", border: "#A8D888", label: "Disponible" },
+  no_disponible: { bg: "#FEE2E2", text: "#991B1B", border: "#FCA5A5", label: "Ocupada" },
+  reservada: { bg: "#FEF3C7", text: "#92400E", border: "#FDE68A", label: "Reservada" },
+  mantenimiento: { bg: "#F1F5F9", text: "#475569", border: "#CBD5E1", label: "Mantenimiento" },
+  inactiva: { bg: "#F1F5F9", text: "#475569", border: "#CBD5E1", label: "Inactiva" },
+};
+
+export type EstadoIncidente = EstadoNovedad;
+
+/** Estados en los que un incidente sigue "abierto" (activo): se usa para bloquear un reporte
+ *  duplicado sobre la misma celda/vehículo mientras el anterior no se resuelva, cierre o
+ *  cancele — ver useIncidenteDialogs.ts y useIncidenteReporte.ts. */
+export const ESTADOS_ABIERTOS: EstadoIncidente[] = ["pendiente", "en_proceso"];
+
+export const ESTADO_CONFIG: Record<EstadoIncidente, {
+  bg: string; text: string; border: string; dot: string; label: string; icon: ReactNode;
+}> = {
+  pendiente: { bg: "#FEF3C7", text: "#92400E", border: "#FDE68A", dot: "#F59E0B", label: "Pendiente", icon: <AlertTriangle size={10} /> },
+  en_proceso: { bg: "#EFF6FF", text: "#1D4ED8", border: "#BFDBFE", dot: "#2563EB", label: "En proceso", icon: <Clock size={10} /> },
+  resuelto: { bg: "#DCFCE7", text: "#166534", border: "#BBF7D0", dot: "#22C55E", label: "Resuelto", icon: <CheckCircle size={10} /> },
+  rechazado: { bg: "#F1F5F9", text: "#475569", border: "#CBD5E1", dot: "#64748B", label: "Rechazado", icon: <Archive size={10} /> },
+  cancelado: { bg: "#FEE2E2", text: "#991B1B", border: "#FCA5A5", dot: "#EF4444", label: "Cancelado", icon: <XCircle size={10} /> },
+};
+
+export const TIPO_NOVEDAD_LABEL: Record<TipoNovedad, string> = {
+  danio: "Daño",
+  accidente: "Accidente",
+  mal_estacionamiento: "Mal estacionamiento",
+  queja: "Queja",
+  otro: "Otro",
+};
+
+/**
+ * Las sugerencias de vehículo: una por cada persona vinculada al vehículo.
+ *
+ * Un carro puede tener copropietarios, y quien reporta necesita ver de quién es el que está
+ * eligiendo — si dos personas comparten uno, aparece dos veces, una por cada nombre. Sin eso,
+ * dos filas idénticas obligan a adivinar cuál corresponde.
+ *
+ * El id de la opción sigue siendo el del vehículo (es lo que se guarda en el reporte); lo que
+ * cambia entre filas hermanas es a quién se atribuye, que es lo que hay que distinguir.
+ */
+export function opcionesDeVehiculo(vehiculos: Vehiculo[]): OpcionBuscable[] {
+  return vehiculos.flatMap((v) => {
+    const duenios = v.copropietarios?.length
+      ? v.copropietarios
+      : [{ id: v.conductorId, nombre: v.conductorNombre, esPrincipal: true }];
+    const modelo = `${v.marca} ${v.modelo ?? ""}`.trim();
+    return duenios
+      .filter((d) => d.nombre)
+      .map((d) => ({
+        id: v.id,
+        titulo: `${v.placa} — ${d.nombre}`,
+        subtitulo: [modelo, d.esPrincipal ? "" : "copropietario"].filter(Boolean).join(" · "),
+      }));
+  });
+}
+
+export const PRIORIDAD_LABEL: Record<PrioridadNovedad, string> = {
+  baja: "Baja",
+  media: "Media",
+  alta: "Alta",
+  critica: "Crítica",
+};
+
+/**
+ * Color de cada prioridad. La urgencia de un incidente tiene que verse antes de leerlo: en
+ * una lista de veinte tarjetas iguales, saber cuál es crítica exigía abrir una por una.
+ * `barra` tiñe el borde superior de la tarjeta y el resto arma la etiqueta.
+ */
+export const PRIORIDAD_CONFIG: Record<PrioridadNovedad, {
+  barra: string; bg: string; text: string; border: string; label: string;
+}> = {
+  baja:    { barra: "#94A3B8", bg: "#F1F5F9", text: "#475569", border: "#CBD5E1", label: "Baja" },
+  media:   { barra: "#3B82F6", bg: "#EFF6FF", text: "#1D4ED8", border: "#BFDBFE", label: "Media" },
+  alta:    { barra: "#F59E0B", bg: "#FEF3C7", text: "#92400E", border: "#FDE68A", label: "Alta" },
+  critica: { barra: "#DC2626", bg: "#FEE2E2", text: "#991B1B", border: "#FCA5A5", label: "Crítica" },
+};

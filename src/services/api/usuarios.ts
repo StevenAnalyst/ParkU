@@ -1,0 +1,232 @@
+/**
+ * Usuarios contra la API real (`/api/usuarios`, solo Admin).
+ *
+ * El documento (`tipo_documento` + `numero_documento`) SÍ es columna de `usuario`: el
+ * backend lo movió a la cuenta (migración 002). Antes no lo era, y esta pantalla lo
+ * guardaba creando un Conductor vinculado — por eso crear una cuenta hacía aparecer un
+ * conductor que nadie había pedido, y esa cuenta quedaba marcada como "ya vinculada" y
+ * desaparecía del selector de Conductores. Ese rodeo ya no existe: el documento viaja en el
+ * mismo POST/PUT que el resto de la cuenta.
+ *
+ * Lo que sigue SIN ser de la cuenta es el "tipo de usuario" (Aprendiz/Instructor/…): es del
+ * conductor, y por eso no se pide en este formulario. El perfil de conductor se crea donde
+ * de verdad hace falta: al registrarse uno mismo, al darlo de alta en Conductores, o al
+ * registrar su vehículo para parquearlo.
+ *
+ * `contrasena` nunca viaja en `update()`: la API rechaza un PUT que la
+ * incluya (usa `PATCH /:id/contrasena`, ver services/api/auth.ts#changePassword)
+ * — no hay forma de que un Admin restablezca la contraseña de otro usuario
+ * sin conocerla, así que si `data.password` llega con contenido en `update`,
+ * simplemente se ignora (no hay endpoint real para esa acción).
+ */
+import { apiFetch } from '../core/http';
+
+export interface Usuario {
+  id: string;
+  correo: string;
+  /** Documento de identidad de la cuenta (columnas reales de `usuario`). */
+  tipoDocumento?: string;
+  numeroDocumento?: string;
+  /** Solo al crear una cuenta de rol Conductor: el backend se lo pone al perfil de
+   *  conductor que crea con ella. No es columna de `usuario` y no vuelve en las lecturas. */
+  tipoUsuarioId?: string;
+  /** Solo se usa al crear; vacío en las respuestas y al editar. */
+  password: string;
+  /** Repetición de la contraseña. La API la EXIGE al crear (`confirmar_contrasena`):
+   *  sin ella responde 400 "Debes confirmar la contraseña". Solo se usa al crear. */
+  confirmPassword?: string;
+  nombre: string;
+  /** Teléfono de contacto de la cuenta (opcional). */
+  numero: string;
+  /** Id del rol tal como lo devuelve la API. No se limita a los 3 roles fijos
+   *  (Admin/Vigilante/Conductor): un Admin puede crear roles nuevos desde la pantalla de
+   *  Roles, y esas cuentas deben conservar SU rol, no caer a uno por defecto. */
+  rol: number;
+  estado: 'activo' | 'inactivo';
+  /** Fecha de creación que devuelva la API. Solo llega en las lecturas: nadie la envía
+   *  al crear o actualizar, por eso es opcional. */
+  fechaCreacion?: string;
+}
+
+interface ApiUsuario {
+  id: number;
+  correo: string;
+  nombre: string;
+  numero_telefonico?: string | null;
+  /** La API real nombra esta columna `rol_id` (confirmado en vivo) — antes se
+   *  leía `rol` (inexistente en la respuesta real), así que todo usuario
+   *  caía siempre al rol por defecto sin importar el suyo real. */
+  rol_id: number;
+  estado: string;
+  tipo_documento?: string | null;
+  numero_documento?: string | null;
+  /** Fecha de alta de la cuenta. El nombre depende de cómo la exponga la API (Sequelize
+   *  suele dar `createdAt`; una columna manual, `created_at` o `fecha_creacion`), así que
+   *  se aceptan las variantes en vez de asumir una: si no llega ninguna, el listado ordena
+   *  por id (ver compararUsuariosPorRecientes). */
+  createdAt?: string | null;
+  created_at?: string | null;
+  fecha_creacion?: string | null;
+}
+
+function toFrontend(u: ApiUsuario): Usuario {
+  return {
+    id: String(u.id),
+    correo: u.correo,
+    password: '',
+    nombre: u.nombre,
+    numero: u.numero_telefonico ?? '',
+    // Antes, cualquier rol que no fuera 1/2/3 se convertía silenciosamente en Conductor:
+    // un usuario con un rol creado por el Admin aparecía (y se guardaba) como otro rol.
+    rol: u.rol_id,
+    estado: u.estado === 'ACTIVO' ? 'activo' : 'inactivo',
+    tipoDocumento: u.tipo_documento ?? '',
+    numeroDocumento: u.numero_documento ?? '',
+    fechaCreacion: u.createdAt ?? u.created_at ?? u.fecha_creacion ?? '',
+  };
+}
+
+export async function getAll(): Promise<Usuario[]> {
+  const rows = await apiFetch<ApiUsuario[]>('/usuarios');
+  return rows.map(toFrontend);
+}
+
+export async function getById(id: string): Promise<Usuario | undefined> {
+  try {
+    return toFrontend(await apiFetch<ApiUsuario>(`/usuarios/${id}`));
+  } catch {
+    return undefined;
+  }
+}
+
+export async function create(data: Omit<Usuario, 'id'>): Promise<Usuario> {
+  const created = await apiFetch<ApiUsuario>('/usuarios', {
+    method: 'POST',
+    body: {
+      correo: data.correo.trim().toLowerCase(),
+      contrasena: data.password,
+      // El endpoint administrativo usa `password` para inicializar el hash de acceso,
+      // mientras que el endpoint de login recibe `contrasena`. Enviar ambos mantiene
+      // compatibles las dos rutas y evita que una cuenta recién creada quede sin una
+      // contraseña válida para iniciar sesión.
+      password: data.password,
+      // Requerido por la API: sin este campo responde 400 "Debes confirmar la contraseña
+      // (envía confirmar_contrasena)" y la cuenta no se crea. Se manda la confirmación que
+      // escribió el usuario; si quien llama no la trae, se repite la contraseña.
+      confirmar_contrasena: data.confirmPassword ?? data.password,
+      nombre: data.nombre,
+      numero_telefonico: data.numero.trim() || undefined,
+      rol_id: data.rol,
+      // La API espera el ENUM en mayúsculas ("ACTIVO"/"INACTIVO"), no un
+      // booleano — confirmado en vivo: enviar `true`/`false` aquí hace que
+      // el backend responda 500 en cada creación.
+      estado: data.estado === 'activo' ? 'ACTIVO' : 'INACTIVO',
+      // Van juntos o no van: el backend responde 400 si llega solo uno.
+      ...(data.numeroDocumento?.trim()
+        ? { tipo_documento: data.tipoDocumento || 'CC', numero_documento: data.numeroDocumento.trim() }
+        : {}),
+      // Solo lo usa el backend si el rol es Conductor (es del perfil de conductor que crea
+      // junto a la cuenta); para cualquier otro rol lo ignora.
+      ...(data.tipoUsuarioId ? { tipo_usuario_id: Number(data.tipoUsuarioId) } : {}),
+    },
+  });
+  return toFrontend(created);
+}
+
+export async function update(id: string, data: Partial<Omit<Usuario, 'id'>>): Promise<Usuario> {
+  const payload: Record<string, unknown> = {};
+  if (data.correo !== undefined) payload.correo = data.correo.trim().toLowerCase();
+  if (data.nombre !== undefined) payload.nombre = data.nombre;
+  if (data.numero !== undefined) payload.numero_telefonico = data.numero.trim() || null;
+  if (data.rol !== undefined) payload.rol_id = data.rol;
+  // Mismo caso que en `create`: el backend exige el ENUM en mayúsculas, un
+  // booleano hace que la actualización falle con 500 (bug reproducido en vivo).
+  if (data.estado !== undefined) payload.estado = data.estado === 'activo' ? 'ACTIVO' : 'INACTIVO';
+  // Igual que en `create`: los dos campos del documento viajan juntos o no viajan.
+  if (data.numeroDocumento?.trim()) {
+    payload.tipo_documento = data.tipoDocumento || 'CC';
+    payload.numero_documento = data.numeroDocumento.trim();
+  }
+  const updated = await apiFetch<ApiUsuario>(`/usuarios/${id}`, { method: 'PUT', body: payload });
+  return toFrontend(updated);
+}
+
+/** Lo que una persona puede cambiar de SU propia cuenta desde la pantalla de Perfil. */
+export interface DatosDePerfil {
+  nombre?: string;
+  correo?: string;
+  numero?: string;
+  tipoDocumento?: string;
+  numeroDocumento?: string;
+}
+
+/**
+ * Guarda el perfil de quien tiene la sesión abierta (PUT /api/usuarios/perfil).
+ *
+ * Es un endpoint aparte de `update` porque este NO exige ser administrador: el id sale del
+ * token, así que nadie puede editar la cuenta de otro por esta vía, y el backend solo admite
+ * estos campos (ni rol, ni estado, ni contraseña). Antes la pantalla de Perfil guardaba los
+ * cambios únicamente en localStorage: se veían en esta sesión y se perdían en la siguiente,
+ * y ni Usuarios ni Conductores se enteraban.
+ */
+export async function actualizarPerfil(data: DatosDePerfil): Promise<Usuario> {
+  const payload: Record<string, unknown> = {};
+  if (data.nombre !== undefined) payload.nombre = data.nombre.trim();
+  if (data.correo !== undefined) payload.correo = data.correo.trim().toLowerCase();
+  // Vaciarlo lo borra: el teléfono es opcional.
+  if (data.numero !== undefined) payload.numero_telefonico = data.numero.trim() || null;
+  // Igual que en create/update: los dos campos del documento viajan juntos o no viajan.
+  if (data.numeroDocumento?.trim()) {
+    payload.tipo_documento = data.tipoDocumento || 'CC';
+    payload.numero_documento = data.numeroDocumento.trim();
+  }
+  const actualizado = await apiFetch<ApiUsuario>('/usuarios/perfil', { method: 'PUT', body: payload });
+  return toFrontend(actualizado);
+}
+
+/** Lo que responde GET /api/usuarios/disponibilidad para un campo. */
+export interface CampoDisponible {
+  disponible: boolean;
+  motivo?: string | null;
+  usuario_id?: number;
+  conductor_id?: number;
+  nombre?: string;
+}
+
+export interface Disponibilidad {
+  disponible: boolean;
+  correo?: CampoDisponible;
+  numero_telefonico?: CampoDisponible;
+  documento?: CampoDisponible;
+}
+
+/**
+ * Pregunta al backend si un correo, un teléfono o un documento ya están ocupados, mirando
+ * tanto las cuentas como los conductores. Es lo que permite avisar MIENTRAS se escribe en
+ * vez de dejar que se rellene todo y descubrir el choque al guardar.
+ *
+ * @param criterios - Al menos uno. excluirUsuarioId evita que una cuenta en edición se
+ *   marque a sí misma como ocupada.
+ */
+export async function comprobarDisponibilidad(criterios: {
+  correo?: string;
+  numeroTelefonico?: string;
+  tipoDocumento?: string;
+  numeroDocumento?: string;
+  excluirUsuarioId?: string;
+}): Promise<Disponibilidad> {
+  const params = new URLSearchParams();
+  if (criterios.correo) params.set('correo', criterios.correo.trim().toLowerCase());
+  if (criterios.numeroTelefonico) params.set('numero_telefonico', criterios.numeroTelefonico.trim());
+  if (criterios.tipoDocumento && criterios.numeroDocumento) {
+    params.set('tipo_documento', criterios.tipoDocumento);
+    params.set('numero_documento', criterios.numeroDocumento.trim());
+  }
+  if (criterios.excluirUsuarioId) params.set('excluir_usuario_id', criterios.excluirUsuarioId);
+  if (![...params.keys()].length) return { disponible: true };
+  return apiFetch<Disponibilidad>(`/usuarios/disponibilidad?${params.toString()}`);
+}
+
+export async function remove(id: string): Promise<void> {
+  await apiFetch<void>(`/usuarios/${id}`, { method: 'DELETE' });
+}

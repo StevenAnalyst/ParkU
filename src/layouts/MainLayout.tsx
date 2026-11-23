@@ -1,0 +1,133 @@
+import { Suspense } from "react";
+import { Outlet } from "react-router-dom";
+import { useIsRestoring } from "@tanstack/react-query";
+import { theme } from "@/styles/theme";
+import { LoadingState } from "@/components/shared";
+import { nombreDeRol } from "@/services/core/roles";
+import { useMainLayoutState } from "./hooks/useMainLayoutState";
+import { mainLayoutStyles } from "./lib/styles";
+import { SIDEBAR_GRADIENT } from "./lib/sidebarTheme";
+import { SIDEBAR_W } from "./lib/menu";
+import { Sidebar } from "./components/Sidebar";
+import { SidebarWatermark } from "./components/SidebarWatermark";
+import { MobileHeader } from "./components/MobileHeader";
+import { MobileBottomNav } from "./components/MobileBottomNav";
+
+const C = theme;
+
+export function MainLayout() {
+  const s = useMainLayoutState();
+  // Mientras React Query restaura la caché guardada (un instante al abrir la app), las
+  // consultas están en pausa y no reportan "cargando": sin esto, cada pantalla pintaba un
+  // fotograma de "sin resultados" antes de que aparecieran los datos.
+  const restaurandoCache = useIsRestoring();
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.bg, display: "flex" }}>
+      {/* ── Desktop Sidebar ────────────────────── */}
+      {!s.hideLayout && (
+        <aside
+          className="hidden-mobile-sidebar"
+          style={{
+            position: "fixed",
+            top: 0, left: 0, bottom: 0,
+            width: s.sidebarWidth,
+            background: SIDEBAR_GRADIENT,
+            display: "flex",
+            flexDirection: "column",
+            zIndex: 80,
+            transition: "width .22s cubic-bezier(.4,0,.2,1)",
+            overflow: "hidden",
+            boxShadow: "2px 0 24px rgba(0,0,0,.1)",
+          }}
+        >
+          <SidebarWatermark />
+          <Sidebar
+            collapsed={s.collapsed}
+            onToggleCollapsed={() => s.setCollapsed((v) => !v)}
+            onCloseMobile={() => s.setMobileOpen(false)}
+            grouped={s.grouped}
+            activePath={s.location.pathname}
+            userName={s.user?.nombre}
+            /* Ver la nota del otro Sidebar: el nombre real del rol lo trae la API. */
+            userRol={s.user ? s.user.rolNombre || nombreDeRol(s.user.rol) : undefined}
+            onLogout={s.handleLogout}
+            pendientes={s.pendientes}
+          />
+        </aside>
+      )}
+
+      {/* ── Mobile overlay ─────────────────────── */}
+      {!s.hideLayout && s.mobileOpen && (
+        <>
+          <div
+            onClick={() => s.setMobileOpen(false)}
+            style={{ position: "fixed", inset: 0, background: "rgba(13,31,5,.35)", backdropFilter: "blur(2px)", zIndex: 110 }}
+          />
+          <aside
+            style={{
+              position: "fixed",
+              top: 0, left: 0, bottom: 0,
+              width: SIDEBAR_W,
+              background: SIDEBAR_GRADIENT,
+              zIndex: 120,
+              display: "flex",
+              flexDirection: "column",
+              boxShadow: "4px 0 32px rgba(0,0,0,.25)",
+              overflow: "hidden",
+            }}
+          >
+            <SidebarWatermark />
+            <Sidebar
+              isMobile
+              collapsed={s.collapsed}
+              onToggleCollapsed={() => s.setCollapsed((v) => !v)}
+              onCloseMobile={() => s.setMobileOpen(false)}
+              grouped={s.grouped}
+              activePath={s.location.pathname}
+              userName={s.user?.nombre}
+              /* El nombre real del rol lo trae la API; nombreDeRol solo conoce los tres
+                 del sistema y devolvía "Desconocido" para cualquier rol creado a medida. */
+              userRol={s.user ? s.user.rolNombre || nombreDeRol(s.user.rol) : undefined}
+              onLogout={s.handleLogout}
+              pendientes={s.pendientes}
+            />
+          </aside>
+        </>
+      )}
+
+      {/* ── Mobile header ──────────────────────── */}
+      {!s.hideLayout && (
+        <MobileHeader onOpenMenu={() => s.setMobileOpen(true)} onGoToPerfil={() => s.navigate("/app/perfil")} />
+      )}
+
+      {/* ── Main content ───────────────────────── */}
+      <main
+        className={s.hideLayout ? "" : "main-with-layout"}
+        style={{
+          flex: 1,
+          minHeight: "100vh",
+          paddingTop: s.hideLayout ? 0 : undefined,
+          paddingBottom: s.hideLayout ? 0 : undefined,
+          paddingInline: s.hideLayout ? 0 : undefined,
+        }}
+      >
+        {/* Límite de suspensión propio: al entrar por primera vez a una página que aún no se
+            descargó, el menú y la cabecera se quedan en su sitio y solo el contenido muestra
+            el spinner — antes suspendía el árbol entero (el Suspense de App.tsx) y toda la
+            pantalla se iba a blanco con un spinner a pantalla completa. */}
+        <Suspense fallback={<LoadingState message="Cargando sección..." />}>
+          {restaurandoCache ? <LoadingState message="Cargando sección..." /> : <Outlet />}
+        </Suspense>
+      </main>
+
+      {/* ── Mobile bottom nav ──────────────────── */}
+      {!s.hideLayout && (
+        <MobileBottomNav items={s.visibleMenuItems} activePath={s.location.pathname} onOpenMenu={() => s.setMobileOpen(true)} />
+      )}
+
+      {/* ── Responsive CSS ─────────────────────── */}
+      <style>{mainLayoutStyles(s.sidebarWidth)}</style>
+    </div>
+  );
+}

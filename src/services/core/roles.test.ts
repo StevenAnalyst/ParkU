@@ -1,0 +1,132 @@
+import { describe, it, expect } from 'vitest';
+import { ROLES, permisosDeVistas, rutaInicial, VISTAS_POR_PERMISO, PERMISOS_POR_ROL } from './roles';
+import { menuItems } from '@/layouts/lib/menu';
+
+/**
+ * Los permisos que el backend concede a un rol tienen que abrir las pantallas
+ * correspondientes. Antes el menú salía SOLO de la matriz estática de los tres roles del
+ * sistema, así que un rol creado a medida entraba sin ninguna pestaña por muchas casillas
+ * que se le marcaran en el editor de roles.
+ */
+describe('permisosDeVistas — de permisos del backend a pantallas', () => {
+  const ROL_A_MEDIDA = 42;
+
+  it('un rol a medida sin permisos no ve ningún módulo, ni siquiera el Dashboard', () => {
+    const vistas = permisosDeVistas(ROL_A_MEDIDA, []);
+    expect(Object.values(vistas).some(Boolean)).toBe(false);
+    expect(vistas.dashboard).toBe(false);
+    expect(vistas.usuarios).toBe(false);
+    expect(vistas.reservas).toBe(false);
+    expect(vistas.roles).toBe(false);
+  });
+
+  it('cada permiso abre su pantalla', () => {
+    expect(permisosDeVistas(ROL_A_MEDIDA, ['reservas.consultar']).reservas).toBe(true);
+    expect(permisosDeVistas(ROL_A_MEDIDA, ['usuarios.consultar']).usuarios).toBe(true);
+    expect(permisosDeVistas(ROL_A_MEDIDA, ['conductores.consultar']).conductores).toBe(true);
+    expect(permisosDeVistas(ROL_A_MEDIDA, ['novedades.consultar']).incidentes).toBe(true);
+    expect(permisosDeVistas(ROL_A_MEDIDA, ['ingreso.gestionar']).entradaSalida).toBe(true);
+    expect(permisosDeVistas(ROL_A_MEDIDA, ['salida.gestionar']).entradaSalida).toBe(true);
+    expect(permisosDeVistas(ROL_A_MEDIDA, ['configuracion.gestionar']).roles).toBe(true);
+    expect(permisosDeVistas(ROL_A_MEDIDA, ['parqueaderos.consultar']).parqueaderos).toBe(true);
+  });
+
+  it('consultar ingresos NO abre la pantalla donde se estaciona para un rol a medida', () => {
+    // Esa pantalla no es un listado: es donde se registra la entrada y la salida de un
+    // vehículo. Abrirla con un permiso de solo consulta le ponía el botón "Estacionar" a un
+    // Conductor, que es justo lo que no debe poder hacer, pero el rol Conductor tiene acceso
+    // normal a la pantalla por su matriz específica.
+    expect(permisosDeVistas(ROL_A_MEDIDA, ['ingreso.consultar']).entradaSalida).toBe(false);
+    expect(permisosDeVistas(ROL_A_MEDIDA, ['salida.consultar']).entradaSalida).toBe(false);
+    expect(permisosDeVistas(ROLES.CONDUCTOR, ['ingreso.consultar', 'reservas.consultar']).entradaSalida).toBe(true);
+  });
+
+  it('los permisos de gestión abren también lo que esa pantalla necesita para actuar', () => {
+    const vistas = permisosDeVistas(ROL_A_MEDIDA, ['parqueaderos.gestionar']);
+    expect(vistas.parqueaderos).toBe(true);
+    expect(vistas.celdas).toBe(true);
+    expect(vistas.asignaciones).toBe(true);
+  });
+
+  it('varios permisos se acumulan, y solo abren lo suyo', () => {
+    const vistas = permisosDeVistas(ROL_A_MEDIDA, ['reservas.gestionar', 'novedades.consultar']);
+    expect(vistas.reservas).toBe(true);
+    expect(vistas.incidentes).toBe(true);
+    expect(vistas.usuarios).toBe(false);
+  });
+
+  it('un permiso que la interfaz todavía no conoce no rompe nada', () => {
+    const vistas = permisosDeVistas(ROL_A_MEDIDA, ['inventado.gestionar']);
+    expect(vistas.dashboard).toBe(false);
+    expect(vistas.usuarios).toBe(false);
+  });
+
+  it('acepta roles que vienen como texto del backend y sigue dejando todo al Administrador', () => {
+    expect(permisosDeVistas('1', [])).toEqual(permisosDeVistas(ROLES.ADMIN, []));
+    expect(permisosDeVistas('ADMIN', [])).toEqual(permisosDeVistas(ROLES.ADMIN, []));
+    expect(permisosDeVistas('administrador', [])).toEqual(permisosDeVistas(ROLES.ADMIN, []));
+  });
+
+  it('el Administrador lo ve todo sin mirar la tabla, salvo el autoservicio "Mis Vehículos"', () => {
+    const { misVehiculos, ...resto } = permisosDeVistas(ROLES.ADMIN, []);
+    expect(Object.values(resto).every(Boolean)).toBe(true);
+    expect(misVehiculos).toBe(false);
+  });
+
+  it('los otros roles del sistema conservan su matriz y los permisos solo SUMAN', () => {
+    // El backend sigue autorizándolos por rol en muchas rutas, así que quitarles lo que ya
+    // tenían por no estar en `rol_permiso` los dejaría sin pantallas que sí pueden usar.
+    const conductor = permisosDeVistas(ROLES.CONDUCTOR, []);
+    expect(conductor).toEqual(PERMISOS_POR_ROL[ROLES.CONDUCTOR]);
+    expect(conductor.entradaSalida).toBe(true);
+    expect(conductor.incidentes).toBe(true);
+
+    const conUsuarios = permisosDeVistas(ROLES.CONDUCTOR, ['usuarios.consultar']);
+    expect(conUsuarios.usuarios).toBe(true);
+    expect(conUsuarios.reservas).toBe(true); // lo que ya tenía sigue ahí
+    expect(conUsuarios.incidentes).toBe(true);
+  });
+
+  it('toda pantalla del menú se puede abrir con algún permiso', () => {
+    // Si se añade una entrada al menú sin un permiso que la habilite, ningún rol a medida
+    // podrá verla nunca: es justo lo que pasaba con Conductores.
+    // Excepción deliberada: "Mis Vehículos" es el autoservicio del rol Conductor y solo lo
+    // abre ese rol, nunca un permiso.
+    const habilitables = new Set(Object.values(VISTAS_POR_PERMISO).flat());
+    const sinPermiso = menuItems.filter(
+      (item) => item.permission !== 'misVehiculos' && !habilitables.has(item.permission),
+    );
+    expect(sinPermiso.map((i) => i.label)).toEqual([]);
+  });
+
+  it('un rol con solo "Registrar salidas" ve únicamente Entrada / Salida y entra directo ahí', () => {
+    const vistas = permisosDeVistas(ROL_A_MEDIDA, ['salida.gestionar']);
+    const abiertas = Object.entries(vistas).filter(([, v]) => v).map(([k]) => k);
+    expect(abiertas).toEqual(['entradaSalida']);
+    expect(rutaInicial(vistas)).toBe('/app/entrada-salida');
+  });
+
+  it('el Dashboard solo lo abre reportes.consultar', () => {
+    const vistas = permisosDeVistas(ROL_A_MEDIDA, ['reportes.consultar', 'reservas.consultar']);
+    expect(vistas.dashboard).toBe(true);
+    expect(rutaInicial(vistas)).toBe('/app/dashboard');
+  });
+
+  it('sin ningún módulo, la pantalla de inicio es el perfil', () => {
+    expect(rutaInicial(permisosDeVistas(ROL_A_MEDIDA, []))).toBe('/app/perfil');
+    expect(rutaInicial(null)).toBe('/app/perfil');
+  });
+
+  it('los roles del sistema siguen entrando por el Dashboard', () => {
+    expect(rutaInicial(permisosDeVistas(ROLES.ADMIN, []))).toBe('/app/dashboard');
+    expect(rutaInicial(permisosDeVistas(ROLES.VIGILANTE, []))).toBe('/app/dashboard');
+    expect(rutaInicial(permisosDeVistas(ROLES.CONDUCTOR, []))).toBe('/app/dashboard');
+  });
+
+  it('"Mis Vehículos" solo lo ve el Conductor, no el Administrador ni quien gestiona conductores', () => {
+    expect(permisosDeVistas(ROLES.ADMIN, []).misVehiculos).toBe(false);
+    expect(permisosDeVistas(ROLES.VIGILANTE, ['conductores.gestionar']).misVehiculos).toBe(false);
+    expect(permisosDeVistas(ROL_A_MEDIDA, ['conductores.gestionar']).misVehiculos).toBe(false);
+    expect(permisosDeVistas(ROLES.CONDUCTOR, []).misVehiculos).toBe(true);
+  });
+});

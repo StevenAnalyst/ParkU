@@ -1,0 +1,220 @@
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { toast } from "sonner";
+import { useAuth } from "@/context/AuthContext";
+import { useRoles, useCreateRol, useUpdateRol, useRemoveRol, useGuardarPermisosDeRol } from "./useRoles";
+import type { Rol } from "@/services/api/roles";
+import { ROLES_PROTEGIDOS, emptyForm, type FormState } from "../lib/helpers";
+import { initialPermisos } from "../lib/permisos";
+
+/** Estado y handlers de la página de Roles: filtrado, modales y mutaciones. */
+export function useRolesPage() {
+  // Para releer los permisos de la sesión en cuanto se guarden (ver handleSave).
+  const { refrescarPermisos } = useAuth();
+  const { data: roles = [], isLoading } = useRoles();
+  const createRolMutation = useCreateRol();
+  const updateRolMutation = useUpdateRol();
+  const removeRolMutation = useRemoveRol();
+  // `mutateAsync` (no `.mutate`): quien llama necesita el `await`/try-catch para no
+  // mostrar un toast de "éxito" ni cerrar su diálogo cuando la mutación en realidad falla.
+  const addRol = useCallback((data: Omit<Rol, "id">) => createRolMutation.mutateAsync(data), [createRolMutation]);
+  const updateRol = useCallback(
+    (id: string, data: Partial<Rol>) => updateRolMutation.mutateAsync({ id, data }),
+    [updateRolMutation]
+  );
+  const removeRol = useCallback((id: string) => removeRolMutation.mutateAsync(id), [removeRolMutation]);
+  const guardarPermisosMutation = useGuardarPermisosDeRol();
+
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [viewOpen, setViewOpen] = useState(false);
+  const [editingRol, setEditingRol] = useState<Rol | null>(null);
+  const [viewingRol, setViewingRol] = useState<Rol | null>(null);
+  const [search, setSearch] = useState("");
+  const [filterEstado, setFilterEstado] = useState<"todos" | "activo" | "inactivo">("todos");
+  // Tarjetas o lista, como en Usuarios y Conductores.
+  const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
+  const [formInitial, setFormInitial] = useState<FormState>(emptyForm());
+  const [rolAEliminar, setRolAEliminar] = useState<Rol | null>(null);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [itemsPerPage, setItemsPerPage] = useState(9);
+
+  const filteredRoles = useMemo(
+    () =>
+      roles.filter((r) => {
+        const matchSearch = r.nombre.toLowerCase().includes(search.toLowerCase());
+        const matchEstado = filterEstado === "todos" || r.estado === filterEstado;
+        return matchSearch && matchEstado;
+      }),
+    [roles, search, filterEstado]
+  );
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [search, filterEstado]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredRoles.length / itemsPerPage));
+
+  useEffect(() => {
+    if (currentPage > totalPages) setCurrentPage(totalPages);
+  }, [currentPage, totalPages]);
+
+  const paginatedRoles = useMemo(
+    () => filteredRoles.slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage),
+    [filteredRoles, currentPage, itemsPerPage]
+  );
+
+  const handleViewModeChange = useCallback((mode: "grid" | "list") => {
+    setViewMode(mode);
+    setItemsPerPage(mode === "list" ? 15 : 9);
+    setCurrentPage(1);
+  }, []);
+
+  const stats = useMemo(
+    () => ({
+      activos: roles.filter((r) => r.estado === "activo").length,
+      protegidos: ROLES_PROTEGIDOS.length,
+      total: roles.length,
+      permisos: Object.keys(initialPermisos).length,
+    }),
+    [roles]
+  );
+
+  const openCreate = useCallback(() => {
+    setEditingRol(null);
+    setFormInitial(emptyForm());
+    setDialogOpen(true);
+  }, []);
+
+  const openEdit = useCallback((rol: Rol) => {
+    setEditingRol(rol);
+    setFormInitial({
+      nombre: rol.nombre,
+      descripcion: rol.descripcion,
+      permisos: { ...rol.permisos },
+      estado: rol.estado,
+    });
+    setViewOpen(false);
+    setDialogOpen(true);
+  }, []);
+
+  const openView = useCallback((rol: Rol) => {
+    setViewingRol(rol);
+    setViewOpen(true);
+  }, []);
+
+  const handleToggleEstado = useCallback(
+    async (rol: Rol) => {
+      if ((ROLES_PROTEGIDOS as readonly string[]).includes(rol.nombre)) {
+        toast.error("Este rol está protegido y no puede deshabilitarse");
+        return;
+      }
+      const nuevoEstado = rol.estado === "activo" ? "inactivo" : "activo";
+      try {
+        await updateRol(rol.id, {
+          nombre: rol.nombre,
+          descripcion: rol.descripcion,
+          permisos: rol.permisos,
+          estado: nuevoEstado,
+        });
+        toast.success(
+          nuevoEstado === "activo" ? "Rol habilitado correctamente" : "Rol deshabilitado correctamente"
+        );
+      } catch (error) {
+        // El toast de error ya lo muestra el manejador centralizado de mutaciones
+        // (services/core/queryFactory.ts).
+        console.error("Error toggling role state:", error);
+      }
+    },
+    [updateRol]
+  );
+
+  // El botón "Eliminar" ni siquiera se muestra para un rol protegido (ver RoleCard.tsx), pero
+  // se revalida aquí también por si acaso — no depender solo de que el botón esté oculto.
+  const handleDeleteRequest = useCallback((rol: Rol) => {
+    if ((ROLES_PROTEGIDOS as readonly string[]).includes(rol.nombre)) {
+      toast.error("Este rol está protegido y no puede eliminarse");
+      return;
+    }
+    setRolAEliminar(rol);
+  }, []);
+
+  const confirmDeleteRol = useCallback(async () => {
+    if (!rolAEliminar) return;
+    try {
+      await removeRol(rolAEliminar.id);
+      toast.success(`Rol "${rolAEliminar.nombre}" eliminado.`);
+      setRolAEliminar(null);
+    } catch (error) {
+      // El toast de error (incl. "existen usuarios asociados" si el backend lo rechaza así)
+      // ya lo muestra useRemoveRol — no se duplica aquí.
+      console.error("Error deleting rol:", error);
+    }
+  }, [rolAEliminar, removeRol]);
+
+  const handleSave = useCallback(
+    async (data: FormState, permisoIds: string[]) => {
+      try {
+        // Al crear hace falta el id que devuelve la API para poder asignarle los permisos:
+        // `rol_permiso` es una tabla aparte y solo se puede escribir con el rol ya existente.
+        let rolId: string;
+        if (editingRol) {
+          await updateRol(editingRol.id, data);
+          rolId = editingRol.id;
+        } else {
+          rolId = (await addRol(data)).id;
+        }
+
+        // Los permisos se guardan también al editar: `guardarPermisosDeRol` compara contra
+        // lo que hay en el backend y solo asigna o quita las diferencias.
+        await guardarPermisosMutation.mutateAsync({ rolId, permisoIds });
+
+        // Si los permisos que acaban de cambiar son los del rol de quien está usando la
+        // aplicación, su menú y sus guardas de ruta tienen que enterarse ya: sin esto había
+        // que cerrar sesión y volver a entrar para ver la pestaña recién concedida.
+        await refrescarPermisos();
+
+        toast.success(editingRol ? "Rol actualizado correctamente" : "Rol creado correctamente");
+        setDialogOpen(false);
+      } catch (error) {
+        // El toast de error lo muestra el manejador centralizado de mutaciones
+        // (services/core/queryFactory.ts) o el propio useGuardarPermisosDeRol.
+        console.error("Error saving role:", error);
+      }
+    },
+    [editingRol, addRol, updateRol, guardarPermisosMutation, refrescarPermisos]
+  );
+
+  return {
+    roles,
+    isLoading,
+    dialogOpen,
+    setDialogOpen,
+    viewOpen,
+    setViewOpen,
+    editingRol,
+    viewingRol,
+    search,
+    setSearch,
+    filterEstado,
+    setFilterEstado,
+    viewMode,
+    setViewMode: handleViewModeChange,
+    formInitial,
+    filteredRoles,
+    paginatedRoles,
+    currentPage,
+    setCurrentPage,
+    itemsPerPage,
+    setItemsPerPage,
+    totalPages,
+    stats,
+    openCreate,
+    openEdit,
+    openView,
+    handleToggleEstado,
+    handleSave,
+    rolAEliminar,
+    setRolAEliminar,
+    handleDeleteRequest,
+    confirmDeleteRol,
+  };
+}

@@ -1,0 +1,216 @@
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { MemoryRouter } from 'react-router-dom';
+import { QueryClientProvider } from '@tanstack/react-query';
+import { AuthProvider } from '@/context/AuthContext';
+import { createTestQueryClient } from '@/test/queryWrapper';
+import { createAppBackends } from '@/test/appFakeApi';
+import { Register } from './Register';
+
+const mockNavigate = vi.fn();
+vi.mock('react-router-dom', async () => {
+  const actual = await vi.importActual<typeof import('react-router-dom')>('react-router-dom');
+  return { ...actual, useNavigate: () => mockNavigate };
+});
+
+vi.mock('sonner', () => ({
+  toast: { success: vi.fn(), error: vi.fn() },
+}));
+
+const apiFetchMock = vi.hoisted(() => vi.fn());
+vi.mock('@/services/core/http', () => ({ apiFetch: apiFetchMock, AUTH_EXPIRED_EVENT: 'parku:auth-expired' }));
+apiFetchMock.mockImplementation(createAppBackends().apiFetch);
+
+import { toast } from 'sonner';
+
+/** El registro empieza con la pregunta "¿tienes carro o moto?"; el formulario solo aparece
+ *  al responder que sí (ver RequisitoVehiculo). */
+async function renderRegister() {
+  const client = createTestQueryClient();
+  const utils = render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <AuthProvider>
+          <Register />
+        </AuthProvider>
+      </MemoryRouter>
+    </QueryClientProvider>
+  );
+  await userEvent.setup().click(screen.getByRole('button', { name: /Sí, tengo vehículo/ }));
+  return utils;
+}
+
+async function fillValidForm(user: ReturnType<typeof userEvent.setup>, overrides?: { correo?: string; identificacion?: string }) {
+  const correo = overrides?.correo ?? `nuevo-${Date.now()}@sena.edu.co`;
+  const identificacion = overrides?.identificacion ?? `${Date.now()}`;
+
+  await user.type(screen.getByLabelText('N.º de identificación'), identificacion);
+  // El registro crea también el perfil de conductor de quien se inscribe, así que pide su
+  // tipo de usuario (Aprendiz/Instructor/…). Solo aparece si su catálogo llegó a cargar.
+  const tipoUsuario = await screen.findByLabelText('Tipo de usuario');
+  const primeraOpcion = tipoUsuario.querySelectorAll('option')[1] as HTMLOptionElement;
+  await user.selectOptions(tipoUsuario, primeraOpcion.value);
+  await user.type(screen.getByLabelText('Nombre Completo'), 'Usuario de Prueba');
+  await user.type(screen.getByLabelText('Correo Electrónico'), correo);
+  await user.type(screen.getByLabelText(/Teléfono/), '3101234567');
+  await user.type(screen.getByLabelText('Contraseña'), 'Pass1234');
+  await user.type(screen.getByLabelText('Confirmar Contraseña'), 'Pass1234');
+  // Vehículo propio, obligatorio para registrarse (ver RequisitoVehiculo/registerForm.ts).
+  await user.type(screen.getByPlaceholderText('Ej: ABC123'), 'ABC123');
+  await user.type(screen.getByPlaceholderText('ej. Chevrolet'), 'Chevrolet');
+  await user.type(screen.getByPlaceholderText('ej. Rojo'), 'Rojo');
+  await user.click(screen.getByLabelText(/Acepto los términos/));
+
+  return { correo, identificacion };
+}
+
+afterEach(() => {
+  localStorage.clear();
+  vi.clearAllMocks();
+});
+
+describe('Register', () => {
+  it('renderiza el formulario de registro', async () => {
+    await renderRegister();
+
+    expect(screen.getByLabelText('Nombre Completo')).toBeInTheDocument();
+    expect(screen.getByLabelText('Correo Electrónico')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Crear cuenta' })).toBeInTheDocument();
+    // "¿Cómo te identificas?" no se usaba para nada real (nunca viajaba al backend) — se quitó
+    // del formulario; el documento de identidad sigue ahí porque sí se valida en vivo.
+    expect(screen.queryByLabelText('¿Cómo te identificas?')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('N.º de identificación')).toBeInTheDocument();
+  });
+
+  it('pide el tipo de usuario, porque el registro crea también el perfil de conductor', async () => {
+    await renderRegister();
+    expect(await screen.findByLabelText('Tipo de usuario')).toBeInTheDocument();
+  });
+
+  it('registra un usuario nuevo con datos válidos y navega al dashboard', async () => {
+    const user = userEvent.setup();
+    await renderRegister();
+
+    await fillValidForm(user);
+    await user.click(screen.getByRole('button', { name: 'Crear cuenta' }));
+
+    await waitFor(() => expect(mockNavigate).toHaveBeenCalledWith('/app/dashboard'));
+    expect(toast.success).toHaveBeenCalled();
+  }, 15000);
+
+  it('deja registrarse sin teléfono: es opcional', async () => {
+    const user = userEvent.setup();
+    await renderRegister();
+
+    const identificacion = String(Date.now());
+    await user.type(screen.getByLabelText('N.º de identificación'), identificacion);
+    const tipoUsuario = await screen.findByLabelText('Tipo de usuario');
+    await user.selectOptions(tipoUsuario, (tipoUsuario.querySelectorAll('option')[1] as HTMLOptionElement).value);
+    await user.type(screen.getByLabelText('Nombre Completo'), 'Sin Telefono');
+    await user.type(screen.getByLabelText('Correo Electrónico'), `sin-tel-${identificacion}@sena.edu.co`);
+    await user.type(screen.getByLabelText('Contraseña'), 'Pass1234');
+    await user.type(screen.getByLabelText('Confirmar Contraseña'), 'Pass1234');
+    await user.type(screen.getByPlaceholderText('Ej: ABC123'), 'ABC123');
+    await user.type(screen.getByPlaceholderText('ej. Chevrolet'), 'Chevrolet');
+    await user.type(screen.getByPlaceholderText('ej. Rojo'), 'Rojo');
+    await user.click(screen.getByLabelText(/Acepto los términos/));
+
+    await user.click(screen.getByRole('button', { name: 'Crear cuenta' }));
+
+    await waitFor(() => expect(mockNavigate).toHaveBeenCalledWith('/app/dashboard'));
+  }, 15000);
+
+  it('muestra un error si el correo ya está registrado', async () => {
+    const user = userEvent.setup();
+    await renderRegister();
+
+    await fillValidForm(user, { correo: 'admin@sena.edu.co' });
+    await user.click(screen.getByRole('button', { name: 'Crear cuenta' }));
+
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith('Ya existe una cuenta registrada con este correo.')
+    );
+    expect(mockNavigate).not.toHaveBeenCalled();
+  }, 15000);
+
+  it('valida en tiempo real (sin enviar el formulario) si el correo ya está registrado', async () => {
+    const user = userEvent.setup();
+    await renderRegister();
+
+    // admin@sena.edu.co ya existe en la semilla (appFakeApi.ts).
+    await user.type(screen.getByLabelText('Correo Electrónico'), 'admin@sena.edu.co');
+
+    expect(await screen.findByText('Este correo ya está registrado')).toBeInTheDocument();
+    // Todavía no se envió el formulario.
+    expect(mockNavigate).not.toHaveBeenCalled();
+  });
+
+  it('valida en tiempo real si el número de teléfono ya está registrado', async () => {
+    const user = userEvent.setup();
+    await renderRegister();
+
+    // El admin (id 1) tiene numero_telefonico '3101234567' en la semilla.
+    await user.type(screen.getByLabelText(/Teléfono/), '3101234567');
+
+    expect(await screen.findByText('Este número ya está registrado')).toBeInTheDocument();
+  });
+
+  it('valida en tiempo real si el documento ya pertenece a un conductor registrado', async () => {
+    const user = userEvent.setup();
+    await renderRegister();
+
+    // El conductor id 1 (semilla, appFakeApi.ts) tiene documento CC 2345678901.
+    // El tipo por defecto del formulario ya es CC, así que basta con escribir el número.
+    await user.type(screen.getByLabelText('N.º de identificación'), '2345678901');
+
+    expect(await screen.findByText('Este documento ya está registrado')).toBeInTheDocument();
+  });
+
+  it('no muestra error de disponibilidad para un correo/número/documento que no están en uso', async () => {
+    const user = userEvent.setup();
+    await renderRegister();
+
+    await user.type(screen.getByLabelText('Correo Electrónico'), `libre-${Date.now()}@sena.edu.co`);
+    await user.type(screen.getByLabelText(/Teléfono/), '3009998877');
+    await user.type(screen.getByLabelText('N.º de identificación'), '9999999999');
+
+    // Primero confirma que el chequeo en vivo realmente arrancó (el debounce
+    // disparó la consulta)...
+    await waitFor(() => expect(screen.queryAllByText('Verificando disponibilidad…').length).toBeGreaterThan(0));
+    // ...y después espera a que termine, antes de afirmar que no quedó
+    // ningún error de disponibilidad.
+    await waitFor(
+      () => expect(screen.queryAllByText('Verificando disponibilidad…').length).toBe(0),
+      { timeout: 2000 }
+    );
+
+    expect(screen.queryByText('Este correo ya está registrado')).not.toBeInTheDocument();
+    expect(screen.queryByText('Este número ya está registrado')).not.toBeInTheDocument();
+    expect(screen.queryByText('Este documento ya está registrado')).not.toBeInTheDocument();
+  });
+});
+
+describe('Register — requisito de vehículo', () => {
+  it('pregunta primero si tiene vehículo y no muestra el formulario hasta responder que sí', async () => {
+    const client = createTestQueryClient();
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <AuthProvider>
+            <Register />
+          </AuthProvider>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    expect(screen.getByText(/¿tienes carro o moto\?/i)).toBeInTheDocument();
+    expect(screen.queryByLabelText('N.º de identificación')).not.toBeInTheDocument();
+
+    await userEvent.setup().click(screen.getByRole('button', { name: /No tengo vehículo/ }));
+    expect(screen.getByText(/no necesitas una cuenta/i)).toBeInTheDocument();
+    expect(screen.queryByLabelText('N.º de identificación')).not.toBeInTheDocument();
+
+    await userEvent.setup().click(screen.getByRole('button', { name: /Sí tengo vehículo, continuar/ }));
+    expect(screen.getByLabelText('N.º de identificación')).toBeInTheDocument();
+  });
+});

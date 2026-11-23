@@ -1,0 +1,215 @@
+import type React from "react";
+import {
+  IconCar as Car,
+  IconBike as Bike,
+  IconTruck as Truck,
+  IconBus as BusIcon,
+  IconWind as Wind,
+  IconSchool as GraduationCap,
+  IconBook2 as BookOpen,
+  IconBriefcase as Briefcase,
+  IconHeartHandshake as Handshake,
+  IconAddressBook as Contact,
+  type TablerIcon,
+} from "@tabler/icons-react";
+import { theme } from "@/styles/theme";
+import {
+  validarPlacaColombiana, validarPlacaPorTipo, tipoVehiculoDesdePlaca, quitarDigitos, TIPOS_DOCUMENTO,
+  validarNumeroDocumento, NUMERO_DOCUMENTO_MAX, TELEFONO_MAX, validarTelefono, filtrarTelefono, EMAIL_REGEX,
+  validarTextoCorto, validarModeloVehiculo, limpiarTexto,
+  MARCA_MAX, LINEA_MAX, COLOR_MAX, DESCRIPCION_VEHICULO_MAX,
+} from "@/utils/validation";
+import { getAvatarGradient, getInitials } from "@/utils/format";
+import type { Vehiculo } from "@/services/api/vehiculos";
+
+export { validarPlacaColombiana, validarPlacaPorTipo, tipoVehiculoDesdePlaca, quitarDigitos, TIPOS_DOCUMENTO };
+export { validarNumeroDocumento, NUMERO_DOCUMENTO_MAX, TELEFONO_MAX, validarTelefono, filtrarTelefono, EMAIL_REGEX };
+export { getAvatarGradient, getInitials };
+export { MARCA_MAX, LINEA_MAX, COLOR_MAX, DESCRIPCION_VEHICULO_MAX };
+
+/** Lo que se pide de un vehículo en cualquiera de los tres formularios que lo crean o editan
+ *  (ficha de conductor, "Agregar vehículo" y "Editar vehículo"). */
+export interface DatosVehiculoForm {
+  placa: string;
+  tipoVehiculo: Vehiculo["tipo"];
+  marca: string;
+  linea: string;
+  modelo: string;
+  color: string;
+  descripcionVehiculo: string;
+}
+
+export interface ErroresVehiculo {
+  placa?: string;
+  marca?: string;
+  linea?: string;
+  modelo?: string;
+  color?: string;
+  descripcionVehiculo?: string;
+}
+
+/**
+ * Validación única del vehículo, la misma para los tres formularios (antes estaba copiada en
+ * cada uno y ninguna acotaba marca, línea, color ni descripción). `placasOcupadas` trae las
+ * placas ya registradas EN OTROS vehículos (quien edita excluye el suyo antes de llamar).
+ */
+export function validarDatosVehiculo(form: DatosVehiculoForm, placasOcupadas: ReadonlySet<string>): ErroresVehiculo {
+  const errores: ErroresVehiculo = {};
+  const placa = form.placa.trim().toUpperCase();
+  if (!placa) {
+    errores.placa = "La placa es obligatoria";
+  } else if (!validarPlacaColombiana(placa)) {
+    errores.placa = "Formato de placa inválido. Usa ABC123 (carro) o ABC12D / ABC12 (moto).";
+  } else if ((form.tipoVehiculo === "carro" || form.tipoVehiculo === "moto") && !validarPlacaPorTipo(placa, form.tipoVehiculo)) {
+    errores.placa = `Seleccionaste "${form.tipoVehiculo}", pero la placa tiene formato de ${tipoVehiculoDesdePlaca(placa)}.`;
+  } else if (placasOcupadas.has(placa)) {
+    errores.placa = "Esta placa ya está registrada en otro vehículo";
+  }
+  const marca = validarTextoCorto(form.marca, "La marca", MARCA_MAX, true);
+  if (marca) errores.marca = marca;
+  const linea = validarTextoCorto(form.linea, "La línea", LINEA_MAX, false);
+  if (linea) errores.linea = linea;
+  const modelo = validarModeloVehiculo(form.modelo);
+  if (modelo) errores.modelo = modelo;
+  const color = validarTextoCorto(form.color, "El color", COLOR_MAX, true);
+  if (color) errores.color = color;
+  if (limpiarTexto(form.descripcionVehiculo).length > DESCRIPCION_VEHICULO_MAX) {
+    errores.descripcionVehiculo = `La descripción no puede superar ${DESCRIPCION_VEHICULO_MAX} caracteres`;
+  }
+  return errores;
+}
+
+export const COLORS = theme;
+
+/** Estilo por tipo de usuario (catálogo real `/api/catalogos/tipos-usuario`:
+ * Aprendiz, Instructor, Administrativo, Contratista, Visitante). Se indexa
+ * por el nombre en minúscula; cualquier valor no listado cae al genérico. */
+const TIPO_USUARIO_STYLES: Record<string, { bg: string; text: string; border: string; dot: string; icon: TablerIcon }> = {
+  instructor:     { bg: "#EFF6FF", text: "#1D4ED8", border: "#BFDBFE", dot: "#2563EB", icon: GraduationCap },
+  aprendiz:       { bg: "#FFFBEB", text: "#92400E", border: "#FDE68A", dot: "#F59E0B", icon: BookOpen },
+  administrativo: { bg: "#F5F3FF", text: "#6D28D9", border: "#DDD6FE", dot: "#8B5CF6", icon: Briefcase },
+  contratista:    { bg: "#ECFEFF", text: "#0E7490", border: "#A5F3FC", dot: "#0891B2", icon: Handshake },
+  visitante:      { bg: "#F1F5F9", text: "#475569", border: "#CBD5E1", dot: "#64748B", icon: Contact },
+};
+const TIPO_USUARIO_DEFAULT = { bg: "#F1F5F9", text: "#475569", border: "#CBD5E1", dot: "#64748B", icon: Contact };
+
+export const getTipoUsuarioStyle = (nombre: string) => ({
+  ...(TIPO_USUARIO_STYLES[nombre.trim().toLowerCase()] ?? TIPO_USUARIO_DEFAULT),
+  label: nombre || "Sin tipo",
+});
+
+/* El tipo de vehículo se lee por su icono y su etiqueta; el color solo acompaña. Antes cada
+   tipo traía tonos propios, parecidos pero distintos a los del sistema, y una ficha de
+   vehículo se veía de otra aplicación. Ahora salen del tema: los mismos azul, ámbar, verde,
+   violeta y rojo que usa el resto. */
+const TIPO_VEHICULO_STYLES: Record<Vehiculo["tipo"], { bg: string; text: string; border: string; dot: string; label: string; icon: typeof Car }> = {
+  carro:     { bg: theme.infoBg,      text: "#1D4ED8",         border: "#BFDBFE",          dot: theme.info,    label: "Carro",     icon: Car },
+  moto:      { bg: theme.amberBg,     text: "#92400E",         border: "#FDE68A",          dot: theme.amber,   label: "Moto",      icon: Bike },
+  bicicleta: { bg: theme.successBg,   text: theme.successText, border: theme.primaryLight, dot: theme.success, label: "Bicicleta", icon: Wind },
+  camion:    { bg: "#F5F3FF",         text: "#6D28D9",         border: "#DDD6FE",          dot: theme.purple,  label: "Camión",    icon: Truck },
+  bus:       { bg: theme.dangerBg,    text: theme.dangerText,  border: theme.dangerBorder, dot: theme.danger,  label: "Bus",       icon: BusIcon },
+};
+
+/**
+ * Tipos que se pueden REGISTRAR hoy: el parqueadero solo gestiona carros y motos, y el
+ * backend rechaza el resto desde el módulo 4. Los demás siguen en TIPO_VEHICULO_STYLES
+ * porque hay que poder LEER los que quedaron registrados antes.
+ */
+export const TIPOS_VEHICULO = ["carro", "moto"] as const;
+
+export const getTipoVehiculoStyle = (tipo: Vehiculo["tipo"]) => TIPO_VEHICULO_STYLES[tipo] ?? TIPO_VEHICULO_STYLES.carro;
+
+export const inputStyle: React.CSSProperties = {
+  width: "100%",
+  padding: "9px 14px",
+  borderRadius: 11,
+  border: `1px solid ${COLORS.border}`,
+  fontSize: 13,
+  outline: "none",
+  fontFamily: "inherit",
+  background: COLORS.bg,
+  color: COLORS.text,
+};
+
+export const inputErrorStyle: React.CSSProperties = {
+  border: "1px solid #FCA5A5",
+  background: "#FEF2F2",
+};
+
+export interface FormState {
+  /** Cuenta de acceso vinculada. Obligatoria salvo que el tipo de usuario sea Visitante:
+   *  sin ella la persona no puede consultar sus reservas ni sus vehículos. */
+  usuarioId: string;
+  /** El "no tengo usuario": en vez de buscar una cuenta, se crea con estos dos campos. */
+  crearCuenta: boolean;
+  password: string;
+  confirmPassword: string;
+  nombre: string;
+  tipoDocumento: (typeof TIPOS_DOCUMENTO)[number];
+  numeroDocumento: string;
+  correo: string;
+  numeroTelefonico: string;
+  tipoUsuarioId: string;
+  movilidadReducida: boolean;
+  tipoDiscapacidad: string;
+  estado: "activo" | "inactivo";
+  /** Foto de perfil (data URL) para reconocer al conductor en el listado. Opcional: el modelo
+   *  real de `conductor` no tiene columna de foto, así que se guarda en este navegador
+   *  — ver services/core/fotosPerfil.ts. */
+  foto: string;
+  placa: string;
+  tipoVehiculo: Vehiculo["tipo"];
+  marca: string;
+  /** Línea del vehículo ("Logan", "Boxer 150"…). Columna real de `vehiculo`. */
+  linea: string;
+  /** Año del modelo. En Colombia el "modelo" de un vehículo ES su año. */
+  modelo: string;
+  color: string;
+  descripcionVehiculo: string;
+}
+
+export const emptyForm = (): FormState => ({
+  usuarioId: "",
+  crearCuenta: false,
+  password: "",
+  confirmPassword: "",
+  nombre: "",
+  tipoDocumento: "CC",
+  numeroDocumento: "",
+  correo: "",
+  numeroTelefonico: "",
+  tipoUsuarioId: "",
+  movilidadReducida: false,
+  tipoDiscapacidad: "",
+  estado: "activo",
+  foto: "",
+  placa: "",
+  tipoVehiculo: "carro",
+  marca: "",
+  linea: "",
+  modelo: "",
+  color: "",
+  descripcionVehiculo: "",
+});
+
+export interface FormErrors {
+  nombre?: string;
+  numeroDocumento?: string;
+  correo?: string;
+  numeroTelefonico?: string;
+  tipoUsuarioId?: string;
+  /** Falta decidir la cuenta: ni se seleccionó una ni se marcó "no tengo usuario". */
+  usuarioId?: string;
+  password?: string;
+  confirmPassword?: string;
+  placa?: string;
+  marca?: string;
+  linea?: string;
+  modelo?: string;
+  color?: string;
+  descripcionVehiculo?: string;
+}
+
+/** Nombre del tipo de usuario que puede ir sin cuenta de acceso. Se compara por nombre, no
+ *  por id: el catálogo es una tabla del backend y sus ids pueden variar. */
+export const TIPO_VISITANTE = "visitante";

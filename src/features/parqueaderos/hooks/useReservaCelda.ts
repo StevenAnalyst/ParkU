@@ -1,0 +1,244 @@
+import { useCallback, useState } from "react";
+import { toast } from "sonner";
+import type { Celda } from "@/services/api/celdas";
+import type { Reserva } from "@/services/api/reservas";
+import { ReservaFormState } from "../components/modals/ReservaModal";
+import type { ParqueaderosData } from "./useParqueaderosData";
+import type { ModalKind } from "./useModalController";
+import { vehiculoNoDisponible, otroVehiculoDelConductorEnUso } from "@/features/conductores";
+import { buscarConflictoHorario, validarFranja, franjaSugerida } from "@/features/reservas";
+import { HORA_OPERACION_INICIO, HORA_OPERACION_FIN, motivoCeldaPreferencialNoApta } from "../lib/helpers";
+import { validarTextoLargo, MOTIVO_MIN, MOTIVO_MAX } from "@/utils/validation";
+import { useEnCurso } from "@/hooks/useEnCurso";
+
+/** Reservar una celda, cancelar su reserva, y liberar una celda ocupada. */
+export function useReservaCelda(
+  data: Pick<ParqueaderosData, "reservas" | "vehiculos" | "celdas" | "conductores" | "controlesSalida" | "parqueaderos" | "addReserva" | "updateReserva" | "updateCelda">,
+  celdaActiva: Celda | null,
+  getOcupante: (celdaId: string) => { controlId: string } | null,
+  updateControlSalida: (id: string, patch: { fechaSalida: string; estado: "finalizado" }) => Promise<unknown>,
+  setOpenModal: (m: ModalKind) => void
+) {
+  // Franja inicial que ya cumple las reglas de tiempo (ver features/reservas/lib/reglas.ts):
+  // el 08:00-18:00 fijo de antes ya estaba en el pasado a media mañana.
+  const [reservaForm, setReservaForm] = useState<ReservaFormState>({
+    vehiculoId: "",
+    parqueaderoId: "",
+    celdaId: "",
+    ...franjaSugerida(),
+    motivo: "",
+    estado: "pendiente",
+  });
+  const [reservaError, setReservaError] = useState<string | null>(null);
+
+  const openReservaFromCelda = useCallback((celda: Celda) => {
+    setReservaForm((prev) => ({
+      ...prev,
+      parqueaderoId: celda.parqueaderoId,
+      celdaId: celda.id,
+      ...franjaSugerida(),
+      motivo: "",
+      estado: "pendiente",
+    }));
+    setReservaError(null);
+    setOpenModal("reserva");
+  }, [setOpenModal]);
+
+  const handleCrearReservaBase = useCallback(async () => {
+    if (!reservaForm.vehiculoId) return setReservaError("Selecciona un vehículo");
+    if (!reservaForm.celdaId) return setReservaError("Selecciona una celda");
+    if (!reservaForm.fechaReserva) return setReservaError("La fecha es requerida");
+    if (!reservaForm.horaInicio || !reservaForm.horaFin) return setReservaError("El horario es requerido");
+    if (!reservaForm.motivo.trim()) return setReservaError("El motivo de la reserva es obligatorio");
+    const errorMotivo = validarTextoLargo(reservaForm.motivo, "El motivo", { min: MOTIVO_MIN, max: MOTIVO_MAX });
+    if (errorMotivo) return setReservaError(errorMotivo);
+
+
+    // A diferencia de la solicitud de un Conductor (useSolicitarReserva.ts, que ya filtra el
+    // selector a solo parqueaderos activos), esta reserva la crea un Admin/Vigilante directo
+    // desde una celda ya elegida en el plano — sin este chequeo, se podía reservar igual en un
+    // parqueadero desactivado.
+    const parqueaderoDeLaCelda = data.parqueaderos.find((p) => p.id === reservaForm.parqueaderoId);
+    if (parqueaderoDeLaCelda && parqueaderoDeLaCelda.estado !== "activo") {
+      return setReservaError("Este parqueadero está inactivo y no acepta nuevas reservas.");
+    }
+
+    // El backend rechaza crear reservas/ingresos fuera de la ventana de operación
+    // (05:00–21:00, ver HORA_OPERACION_INICIO/FIN) — sin este chequeo, una reserva fuera de
+    // horario solo se entera de que es inválida hasta que el backend la rechaza con un error
+    // genérico. Comparación como string funciona porque el input <input type="time"> siempre
+    // entrega "HH:MM" con cero a la izquierda.
+    if (reservaForm.horaInicio < HORA_OPERACION_INICIO || reservaForm.horaFin > HORA_OPERACION_FIN) {
+      return setReservaError(`El horario debe estar entre ${HORA_OPERACION_INICIO} y ${HORA_OPERACION_FIN} (horario de operación).`);
+    }
+
+    // Los `min` de los campos de fecha y hora ya dejan fuera lo que no sirve, pero ese
+    // límite es solo de interfaz: se puede escribir a mano. Aquí se revalidan las tres
+    // reglas de tiempo (nada en el pasado, anticipación mínima y duración mínima), las
+    // mismas que aplica el backend — ver features/reservas/lib/reglas.ts.
+    const problemaDeFranja = validarFranja(reservaForm);
+    if (problemaDeFranja) return setReservaError(problemaDeFranja);
+
+    try {
+      // Choque de horario real (misma celda + fecha/hora que se solapan), no "cualquier
+      // pendiente/activa de la celda sin importar cuándo" — la misma lógica de referencia que
+      // usa useReservasPage.ts al aceptar una solicitud (lib/helpers.ts de reservas), así una
+      // reserva futura sin solape deja de bloquearse por una pendiente/activa vieja y ajena.
+      const conflicto = buscarConflictoHorario(reservaForm, data.reservas);
+      if (conflicto) {
+        const vehiculo = data.vehiculos.find((v) => v.id === conflicto.vehiculoId);
+        setReservaError(
+          `La celda ya tiene una reserva activa en ese horario (vehículo ${vehiculo?.placa || "—"}, ` +
+          `${conflicto.fechaReserva} de ${conflicto.horaInicio} a ${conflicto.horaFin})`
+        );
+        return;
+      }
+
+      const vehiculoReservado = data.vehiculos.find((v) => v.id === reservaForm.vehiculoId);
+      if (!vehiculoReservado) { setReservaError("Vehículo no encontrado"); return; }
+
+      // El vehículo tiene que caber en la celda reservada. El selector del modal ya solo
+      // ofrece vehículos compatibles (ver ParqueaderosPage), pero la celda pudo cambiar de
+      // tipo desde que se abrió el modal, así que se revalida contra el dato fresco.
+      const celdaDeLaReserva = data.celdas.find((c) => c.id === reservaForm.celdaId);
+      if (celdaDeLaReserva && celdaDeLaReserva.tipo !== vehiculoReservado.tipo) {
+        setReservaError(
+          `La celda ${celdaDeLaReserva.numero} es para vehículos de tipo "${celdaDeLaReserva.tipo}" ` +
+          `y ${vehiculoReservado.placa} es de tipo "${vehiculoReservado.tipo}".`
+        );
+        return;
+      }
+
+      // Una celda preferencial solo la puede reservar quien tiene la condición registrada:
+      // la base de datos lo exige con un trigger, y sin esto el aviso llegaba como un error
+      // crudo de Postgres después de rellenar el formulario entero.
+      const conductorDeLaReserva = data.conductores.find((c) => c.id === vehiculoReservado.conductorId);
+      const noApta = celdaDeLaReserva
+        ? motivoCeldaPreferencialNoApta(celdaDeLaReserva, conductorDeLaReserva)
+        : null;
+      if (noApta) { setReservaError(noApta); return; }
+
+      // Una reserva responde siempre a una persona: sin conductor asociado no habría a quién
+      // exigirle la celda al llegar, ni con quién comparar en el ingreso (ver
+      // useIngresoVehiculo, que solo deja estacionar al conductor de la reserva).
+      if (!vehiculoReservado.conductorId) {
+        setReservaError(`El vehículo ${vehiculoReservado.placa} no tiene un conductor asociado. Asígnale uno en el módulo Conductores antes de reservar.`);
+        return;
+      }
+
+      // El vehículo (o cualquier otro del mismo conductor) no puede estar ya estacionado ni
+      // tener otra reserva pendiente/activa en otra celda — un conductor solo usa un vehículo
+      // suyo a la vez.
+      const motivoNoDisponible =
+        vehiculoNoDisponible(vehiculoReservado, data.controlesSalida, data.reservas, reservaForm.fechaReserva) ??
+        (vehiculoReservado.conductorId
+          ? otroVehiculoDelConductorEnUso(
+            vehiculoReservado.conductorId, vehiculoReservado.id, data.vehiculos, data.controlesSalida, data.reservas, reservaForm.fechaReserva
+          )
+          : null);
+      if (motivoNoDisponible) { setReservaError(motivoNoDisponible.motivo); return; }
+
+      // `POST /reservas` siempre crea en estado PENDIENTE (el backend no acepta otro estado
+      // inicial) — como esta reserva la hace directamente un Admin/Vigilante desde el plano
+      // de Parqueaderos (a diferencia de una solicitud de Conductor), se aprueba de inmediato
+      // con un segundo PATCH en vez de dejarla esperando en "Solicitudes pendientes".
+      const creada = await data.addReserva({
+        tipoReserva: "visitante",
+        vehiculoId: reservaForm.vehiculoId,
+        celdaId: reservaForm.celdaId,
+        conductorId: vehiculoReservado.conductorId,
+        motivo: reservaForm.motivo.trim(),
+        motivoRechazo: "",
+        fechaReserva: reservaForm.fechaReserva,
+        horaInicio: reservaForm.horaInicio,
+        horaFin: reservaForm.horaFin,
+        estado: "pendiente",
+      });
+      await data.updateReserva(creada.id, { estado: "activa" });
+      await data.updateCelda(reservaForm.celdaId, { estado: "reservada" });
+      toast.success(`Reserva creada para la celda ${celdaActiva?.numero}`);
+      setOpenModal(null);
+      setReservaError(null);
+      setReservaForm((prev) => ({ ...prev, vehiculoId: "", horaInicio: "08:00", horaFin: "18:00", motivo: "" }));
+    } catch (error) {
+      // El toast de error ya lo muestra el manejador centralizado de mutaciones
+      // (services/core/queryFactory.ts).
+      console.error(error);
+    }
+  }, [reservaForm, data, celdaActiva, setOpenModal]);
+
+  // Evita el doble envío (doble clic, o una conexión lenta): useEnCurso usa una ref, no solo
+  // estado, así que bloquea incluso dos clics en el mismo tick, antes de que React
+  // re-renderice el botón deshabilitado.
+  const [handleCrearReserva, creandoReserva] = useEnCurso(handleCrearReservaBase);
+
+  /** La reserva viva de la celda abierta: es la que se cancelaría desde aquí. */
+  /* Cuál se está cancelando. Una celda puede tener varias reservas el mismo día, así que la
+     elige quien pulsa: derivarla ("la que rige", "la primera de la lista") cancelaba una
+     franja distinta de la que la persona tenía delante. */
+  const [reservaACancelar, setReservaACancelar] = useState<Reserva | null>(null);
+
+  /** Abre el formulario de cancelación de UNA reserva — el mismo que usa el módulo de Reservas. */
+  const handleCancelarReserva = useCallback((reserva: Reserva) => {
+    setReservaACancelar(reserva);
+    setOpenModal("cancelarReserva");
+  }, [setOpenModal]);
+
+  /**
+   * Cancela con el motivo escrito. La celda NO se toca desde aquí: el backend la libera al
+   * cambiar el estado de la reserva (y solo si seguía reservada, no si ya entró un vehículo).
+   */
+  const confirmarCancelarReserva = useCallback(async (motivo: string) => {
+    if (!reservaACancelar) { setOpenModal(null); return; }
+    // El diálogo se cierra antes de esperar al backend: la reserva ya figura cancelada en el
+    // plano (la mutación es optimista, ver useUpdateReserva en features/reservas) y, si el
+    // backend la rechaza, vuelve sola a como estaba con su aviso.
+    const reserva = reservaACancelar;
+    setReservaACancelar(null);
+    setOpenModal(null);
+    try {
+      await data.updateReserva(reserva.id, { estado: "cancelada", motivoRechazo: motivo });
+      toast.info("Reserva cancelada.");
+    } catch (error) {
+      // El aviso de error lo muestra el manejador central de mutaciones.
+      console.error("Error cancelling reserva:", error);
+    }
+  }, [reservaACancelar, data, setOpenModal]);
+
+  const handleRequestLiberar = useCallback(async () => {
+    if (!celdaActiva) return;
+    const ocupante = getOcupante(celdaActiva.id);
+    try {
+      if (ocupante && ocupante.controlId) {
+        // ISO completo (con el offset UTC "Z"), igual que `combinarFechaHora()` en
+        // services/api/reservas.ts — truncar a `.slice(0, 16)` deja un string timezone-naive
+        // que, si el backend lo interpreta como hora LOCAL en vez de UTC, desfasa la salida
+        // registrada varias horas (mismo bug que `fechaEntrada` en useIngresoVehiculo.ts).
+        await updateControlSalida(ocupante.controlId, { fechaSalida: new Date().toISOString(), estado: "finalizado" });
+      }
+      await data.updateCelda(celdaActiva.id, { estado: "disponible", ocupada: false });
+      toast.info(`Celda ${celdaActiva.numero} liberada.`);
+      setOpenModal(null);
+    } catch (error) {
+      console.error("Error releasing celda:", error);
+    }
+  }, [celdaActiva, data, getOcupante, updateControlSalida, setOpenModal]);
+
+  /* Liberar la celda registra la salida del vehículo y no se deshace: el botón "Liberar
+     Celda" solo la pide, y se ejecuta al confirmarla en el diálogo (igual que en Entrada /
+     Salida). */
+  const [liberarPendiente, setLiberarPendiente] = useState(false);
+  const pedirLiberar = useCallback(() => setLiberarPendiente(true), []);
+  const cancelarLiberar = useCallback(() => setLiberarPendiente(false), []);
+  const confirmarLiberar = useCallback(async () => {
+    await handleRequestLiberar();
+    setLiberarPendiente(false);
+  }, [handleRequestLiberar]);
+
+  return {
+    reservaForm, setReservaForm, reservaError, creandoReserva,
+    openReservaFromCelda, handleCrearReserva, handleCancelarReserva, confirmarCancelarReserva,
+    reservaACancelar, handleRequestLiberar,
+    liberarPendiente, pedirLiberar, cancelarLiberar, confirmarLiberar,
+  };
+}

@@ -1,0 +1,173 @@
+/**
+ * Celdas contra la API real (`/api/celdas`). `estado` conserva los nombres
+ * en minúscula que ya usaba el mock (`disponible/no_disponible/reservada/
+ * mantenimiento`) — se traduce `OCUPADA` (nombre real) <-> `no_disponible`
+ * (nombre que ya esperaba toda la UI) para no tener que tocar cada
+ * componente que compara ese valor — más un 5º estado nuevo sin
+ * equivalente mock (`inactiva`). `tipo` (forma del vehículo) y `usabilidad`
+ * (general/ejecutivo/movilidad reducida/vehículo SENA) son campos separados
+ * en el modelo real: el mock los mezclaba en un solo `tipo` con el valor
+ * especial `"movilidad reducida"`.
+ */
+import { apiFetch, crearConRespaldo } from '../core/http';
+
+export type TipoCelda = 'carro' | 'moto' | 'bicicleta' | 'camion' | 'bus';
+export type UsabilidadCelda = 'general' | 'ejecutivo' | 'movilidad_reducida' | 'vehiculo_sena';
+export type EstadoCelda = 'disponible' | 'no_disponible' | 'reservada' | 'mantenimiento' | 'inactiva';
+
+export interface Celda {
+  id: string;
+  parqueaderoId: string;
+  numero: string;
+  tipo: TipoCelda;
+  usabilidad: UsabilidadCelda;
+  estado: EstadoCelda;
+  /** Derivado de `estado === 'no_disponible'` — se conserva por compatibilidad con la UI existente. */
+  ocupada: boolean;
+  observaciones: string;
+}
+
+const ESTADO_DESDE_API: Record<string, EstadoCelda> = {
+  DISPONIBLE: 'disponible', OCUPADA: 'no_disponible', RESERVADA: 'reservada',
+  MANTENIMIENTO: 'mantenimiento', INACTIVA: 'inactiva',
+};
+const ESTADO_A_API: Record<EstadoCelda, string> = {
+  disponible: 'DISPONIBLE', no_disponible: 'OCUPADA', reservada: 'RESERVADA',
+  mantenimiento: 'MANTENIMIENTO', inactiva: 'INACTIVA',
+};
+
+interface ApiCelda {
+  id: number;
+  parqueadero: number;
+  numero: string;
+  tipo: string;
+  usabilidad: string;
+  estado: string;
+  observaciones: string | null;
+}
+
+function toFrontend(c: ApiCelda): Celda {
+  const estado = ESTADO_DESDE_API[c.estado] ?? 'disponible';
+  return {
+    id: String(c.id),
+    parqueaderoId: String(c.parqueadero),
+    numero: c.numero,
+    tipo: (c.tipo?.toLowerCase() as TipoCelda) ?? 'carro',
+    usabilidad: (c.usabilidad?.toLowerCase() as UsabilidadCelda) ?? 'general',
+    estado,
+    ocupada: estado === 'no_disponible',
+    observaciones: c.observaciones ?? '',
+  };
+}
+
+function toApiPayload(data: Partial<Omit<Celda, 'id'>>): Record<string, unknown> {
+  const payload: Record<string, unknown> = {};
+  if (data.parqueaderoId !== undefined) payload.parqueadero = Number(data.parqueaderoId);
+  if (data.numero !== undefined) payload.numero = data.numero;
+  if (data.tipo !== undefined) payload.tipo = data.tipo.toUpperCase();
+  if (data.usabilidad !== undefined) payload.usabilidad = data.usabilidad.toUpperCase();
+  if (data.estado !== undefined) payload.estado = ESTADO_A_API[data.estado];
+  if (data.observaciones !== undefined) payload.observaciones = data.observaciones || null;
+  return payload;
+}
+
+export async function getAll(): Promise<Celda[]> {
+  const rows = await apiFetch<ApiCelda[]>('/celdas');
+  return rows.map(toFrontend);
+}
+
+export async function getById(id: string): Promise<Celda | undefined> {
+  try {
+    return toFrontend(await apiFetch<ApiCelda>(`/celdas/${id}`));
+  } catch {
+    return undefined;
+  }
+}
+
+export async function create(data: Omit<Celda, 'id'>): Promise<Celda> {
+  // `POST /celdas` crea el registro pero responde `null` en el body (bug
+  // confirmado en vivo del backend) — `crearConRespaldo` lo recupera con un
+  // GET a la lista si el POST no lo trae.
+  const created = await crearConRespaldo<ApiCelda>('/celdas', toApiPayload(data), () => apiFetch<ApiCelda[]>('/celdas'));
+  return toFrontend(created);
+}
+
+export async function update(id: string, data: Partial<Omit<Celda, 'id'>>): Promise<Celda> {
+  // Confirmado leyendo el backend real: `PUT /celdas/:id` IGNORA a propósito el campo
+  // `estado` (su propio swagger lo documenta como "solo lectura aquí" — ver
+  // cambiarDisponibilidad más abajo para el único canal que sí lo aplica). El resto de campos
+  // (numero, tipo, usabilidad, observaciones) sí se actualizan por esta vía normal. Los
+  // llamadores que solo cambian `estado` (p. ej. tras aceptar/cancelar una reserva o
+  // registrar un ingreso/salida) siguen pasando por aquí a propósito: ese `estado` real ya lo
+  // mueve un trigger de base de datos del lado del backend, y esta llamada solo sirve para
+  // invalidar la query de celdas y refrescar la UI con el valor que puso el trigger.
+  const updated = await apiFetch<ApiCelda>(`/celdas/${id}`, { method: 'PUT', body: toApiPayload(data) });
+  return toFrontend(updated);
+}
+
+/** Motivo obligatorio que exige el backend para un cambio manual de disponibilidad. */
+export type MotivoDisponibilidad =
+  | 'mantenimiento' | 'danio' | 'error_asignacion' | 'ajuste_operativo' | 'otro';
+
+const MOTIVO_A_API: Record<MotivoDisponibilidad, string> = {
+  mantenimiento: 'MANTENIMIENTO', danio: 'DANIO', error_asignacion: 'ERROR_ASIGNACION',
+  ajuste_operativo: 'AJUSTE_OPERATIVO', otro: 'OTRO',
+};
+
+/**
+ * Cambia manualmente el estado de una celda (mantenimiento, inactivar, reactivar, corregir
+ * una celda atascada) — a diferencia de `update()`, esto SÍ aplica el `estado`: es el único
+ * canal real para hacerlo, vía `PUT /celdas/:id/disponibilidad` (exige `motivo` y queda
+ * registrado en el historial de disponibilidad del backend). No usar esto para lo que ya
+ * resuelve solo un trigger de la base de datos (aceptar/cancelar una reserva, registrar un
+ * ingreso/salida) — solo para un ajuste manual real hecho por un Admin/Vigilante.
+ */
+export async function cambiarDisponibilidad(
+  id: string,
+  estado: EstadoCelda,
+  motivo: MotivoDisponibilidad,
+  observacion?: string
+): Promise<Celda> {
+  // Mismo bug confirmado en vivo que el resto de creaciones/actualizaciones de este backend:
+  // el PUT aplica el cambio de verdad, pero responde `null` en el body en vez del registro
+  // actualizado — se recupera con un GET directo por id si no lo trae.
+  const updated = await apiFetch<ApiCelda | null>(`/celdas/${id}/disponibilidad`, {
+    method: 'PUT',
+    body: { estado: ESTADO_A_API[estado], motivo: MOTIVO_A_API[motivo], observacion: observacion?.trim() || undefined },
+  });
+  return toFrontend(updated ?? await apiFetch<ApiCelda>(`/celdas/${id}`));
+}
+
+export async function remove(id: string): Promise<void> {
+  await apiFetch<void>(`/celdas/${id}`, { method: 'DELETE' });
+}
+
+export interface GenerarLoteCantidades {
+  carros: number;
+  motos: number;
+  movilidadReducida: number;
+}
+
+/**
+ * Genera en lote las celdas de un parqueadero recién creado (numeración
+ * automática "C-001"/"M-001"/"PMR-001"... del lado del backend, en una sola
+ * transacción). Usado por el formulario simplificado de creación de
+ * parqueadero, que ya no pide crear las celdas una por una.
+ *
+ * Confirmado en vivo: el backend espera `cantidadCarro`/`cantidadMoto`/
+ * `cantidadMovilidadReducida` (no los nombres cortos que usa el resto del
+ * frontend) — sin este mapeo, el backend no reconocía ninguno de los tres
+ * campos, los trataba como 0 y rechazaba la petición con "Debes indicar al
+ * menos una cantidad mayor a 0" aunque el formulario sí traía cantidades.
+ */
+export async function generarLote(parqueaderoId: string, cantidades: GenerarLoteCantidades): Promise<Celda[]> {
+  const creadas = await apiFetch<ApiCelda[]>(`/celdas/parqueadero/${parqueaderoId}/generar-lote`, {
+    method: 'POST',
+    body: {
+      cantidadCarro: cantidades.carros,
+      cantidadMoto: cantidades.motos,
+      cantidadMovilidadReducida: cantidades.movilidadReducida,
+    },
+  });
+  return creadas.map(toFrontend);
+}
